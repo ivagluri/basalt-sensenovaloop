@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace basalt::kernels {
 
@@ -66,5 +67,31 @@ inline size_t hc_plain_workspace_floats(int n_tokens, int n_mix = 8) { return (s
 /// result for a token does not depend on n_tokens.
 void hc_mixes_plain(const float* x, const float* hc_fn, const float* hc_scale, const float* hc_base, int n_tokens,
                     int n_mix, const HcPlainArgs& a, float* workspace, float* coef, void* stream);
+
+// ---- two streams, log-space Sinkhorn (SenseNova Loop) ----------------------------------------------------------------
+// The streams are BF16 rows [T][2][n_embd].  A sublayer's router is an fp32 linear map W [8][2 n_embd] with bias [8] of the
+// RMS-normalised streams (no norm weight): pre = sigmoid(l[0:2]), post = 2 sigmoid(l[2:4]) and mix = exp of 20 rounds of
+// log-space Sinkhorn on l[4:8] as a 2x2 matrix (mix[dst][src], each round rows then columns).  The roundings are the
+// reference's (BF16 residual math): the branch is bf16(bf16(pre0) r0 + bf16(pre1) r1), the merge
+// bf16(bf16(mix[d] . r) + bf16(bf16(post[d]) out)) per stream.  A token's result does not depend on T.
+
+constexpr int kHc2Coef = 8;           ///< per token: pre[2], post[2], mix[2][2] (mix[dst][src])
+
+struct Hc2Args {
+    int n_embd = 4096;                ///< a multiple of 8
+    int iters = 20;                   ///< Sinkhorn rounds
+    float rms_eps = 1e-6f;
+    float pre_scale = 1.0f;           ///< the branch times this (rounded to BF16 again when not 1)
+};
+
+/// The router of a sublayer and its input: per token its coefficients (coef [T][8]) and the branch (branch [T][n_embd]).
+/// `enter`: the streams start here, each a copy of x ([T][n_embd], which branch may alias), written to xs first; else
+/// they are xs ([T][2][n_embd]).
+void hc2_pre(uint16_t* xs, const uint16_t* x, bool enter, const float* w, const float* bias, int n_tokens, const Hc2Args& a,
+             float* coef, uint16_t* branch, void* stream);
+/// The sublayer's output `out` ([T][n_embd], BF16) merged into the streams in place: xs[d] = mix[d] . xs + post[d] out.
+/// `leave`: the merged streams' mean goes to x_mean ([T][n_embd], may alias out) instead, xs left as it was.
+void hc2_merge(uint16_t* xs, const uint16_t* out, const float* coef, int n_tokens, int n_embd, bool leave, uint16_t* x_mean,
+               void* stream);
 
 }  // namespace basalt::kernels

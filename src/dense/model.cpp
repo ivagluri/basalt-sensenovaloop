@@ -2,6 +2,8 @@
 #include "basalt/core/device_copy.hpp"
 #include "internal.hpp"
 
+#include "basalt/kernels/mhc.hpp"
+
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/logprobs.hpp"
@@ -43,11 +45,22 @@ void* Arena::take_bytes(size_t n) {
     return base_ + at;
 }
 
+int Geometry::stored_layers() const {
+    return physical.empty() ? n_layers : 1 + *std::max_element(physical.begin(), physical.end());
+}
+
 int Geometry::gdn_layers() const { return (int) std::count(kinds.begin(), kinds.end(), Mixer::Gdn); }
 int Geometry::attn_layers() const { return (int) std::count(kinds.begin(), kinds.end(), Mixer::Attention); }
 
 std::string Geometry::check() const {
     if ((int) kinds.size() != n_layers || n_layers <= 0) return "the layer kinds do not cover the layers";
+    if (!physical.empty()) {
+        if ((int) physical.size() != n_layers) return "the loop's plan does not cover the layer visits";
+        for (int p : physical)
+            if (p < 0 || p >= n_layers) return "the loop's plan names a layer out of range";
+    }
+    if (hc_streams != 0 && (hc_streams != 2 || hc_iters < 1 || !(hc_pre_scale > 0.0f) || n_embd % 8))
+        return "hyper-connections: two streams only";
     if (n_embd % 256 || n_ff % 256) return "widths must be whole 256-value blocks";
     if (attn_layers() > 0) {
         if (head_dim != 256) return "attention heads must be 256 wide";
@@ -135,7 +148,8 @@ size_t window_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_conte
     f += block_scratch_floats(g, bd);
     size_t wp, wt;
     wgemm_need(g, wp, wt);
-    return f * 4 + 2 * act_slot(g) + q8_slot(g) + (wp + wt + 1) * 4 + W * 4 * 6 + 76 * 256;
+    const size_t hc = g.hc_streams ? W * 2 * H * 2 + W * kernels::kHc2Coef * 4 + 2 * 256 : 0;   // the streams, coefficients
+    return f * 4 + 2 * act_slot(g) + q8_slot(g) + (wp + wt + 1) * 4 + W * 4 * 6 + 76 * 256 + hc;
 }
 
 size_t chunk_bytes(const Geometry& g) {
@@ -150,7 +164,8 @@ size_t chunk_bytes(const Geometry& g) {
                                               kernels::gqa_prompt_split_floats((int64_t) T, g.n_head, kAttnSplits) * 4
                                         : 0;
     const size_t ffn = 3 * T * g.n_ff * 4;
-    return keep + std::max({gdn, attn, ffn}) + T * 4 * 6 + 32 * 256;
+    const size_t hc = g.hc_streams ? T * 2 * H * 2 + T * kernels::kHc2Coef * 4 + 2 * 256 : 0;   // the streams, coefficients
+    return keep + hc + std::max({gdn, attn, ffn}) + T * 4 * 6 + 32 * 256;
 }
 
 }  // namespace
@@ -458,6 +473,10 @@ bool Model::ensure_chunk(std::string& err) {
     const size_t widest = std::max<size_t>({H, (size_t) gg.n_ff, VD, AQ});
     ChunkScratch& b = cs;
     b.x = pre_arena.take<float>(T * H);
+    if (gg.hc_streams) {
+        b.xs = pre_arena.take<uint16_t>(T * 2 * H);
+        b.hcoef = pre_arena.take<float>(T * kernels::kHc2Coef);
+    }
     b.xn = pre_arena.take<float>(T * H);
     b.tmp = pre_arena.take<float>(T * H);
     b.xq = pre_arena.take_bytes(std::max(prefill::mmq::q8_bytes(T, (int64_t) widest), prefill::fp8::act_bytes(T, (int64_t) widest)));
@@ -529,6 +548,25 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         err = o.arch + ": --kv nvfp4 needs 256-wide heads, the int8 buffers (kv_int8) and every cell on the card (no --kv-resident)";
         return nullptr;
     }
+    if ((int) w.layers.size() != g.stored_layers()) {
+        err = o.arch + ": " + std::to_string(w.layers.size()) + " layers of weights for " + std::to_string(g.stored_layers()) + " stored layers";
+        return nullptr;
+    }
+    for (int il = 0; il < g.n_layers; ++il) {
+        const Layer& L = w.layers[(size_t) g.layer_of(il)];
+        if (L.kind != g.kinds[(size_t) il]) {
+            err = o.arch + ": layer visit " + std::to_string(il) + " runs a layer of the other kind";
+            return nullptr;
+        }
+        if ((L.hc.attn_w != nullptr) != (L.hc.ffn_w != nullptr) || (L.hc.attn_w && !g.hc_streams)) {
+            err = o.arch + ": layer " + std::to_string(g.layer_of(il)) + "'s hyper-connections do not match the geometry";
+            return nullptr;
+        }
+    }
+    if ((!g.physical.empty() || g.hc_streams) && (o.layer_begin != 0 || (o.layer_end != 0 && o.layer_end != g.n_layers))) {
+        err = o.arch + ": a looped model or one with hyper-connections runs on one card";
+        return nullptr;
+    }
     m->lb = o.layer_begin;
     m->le = o.layer_end > 0 ? o.layer_end : g.n_layers;
     if (m->lb < 0 || m->lb >= m->le || m->le > g.n_layers) {
@@ -568,6 +606,10 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     WindowScratch& b = m->ws;
     Arena& a = m->dec_arena;
     b.x = a.take<uint16_t>(W * H);
+    if (g.hc_streams) {
+        b.xs = a.take<uint16_t>(W * 2 * H);
+        b.hcoef = a.take<float>(W * kernels::kHc2Coef);
+    }
     b.xn = a.take<float>(W * H);
     b.tmp = a.take<float>(W * H);
     b.dacc = a.take<float>(W * H);

@@ -583,6 +583,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/nvfp4_planes.cu
                         src/kernels/cuda/mhc.cu
                         src/kernels/cuda/mhc_plain.cu
+                        src/kernels/cuda/mhc2.cu
                         src/kernels/cuda/router.cu
                         src/kernels/cuda/route_tail_skip.cu
                         src/kernels/cuda/row_norm.cu
@@ -987,6 +988,11 @@ add_executable(gdn_heads_parity tests/kernels/gdn_heads_parity.cpp)
 target_link_libraries(gdn_heads_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gdn_heads_parity COMMAND gdn_heads_parity)
 set_tests_properties(gdn_heads_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+# the two-stream hyper-connections (hc2_pre, hc2_merge) against a CPU port of the reference router
+add_executable(mhc2_parity tests/kernels/mhc2_parity.cpp)
+target_link_libraries(mhc2_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME mhc2_parity COMMAND mhc2_parity)
+set_tests_properties(mhc2_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 add_executable(window_gemm_parity tests/kernels/window_gemm_parity.cpp)
 target_link_libraries(window_gemm_parity PRIVATE window_gemm kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME window_gemm_parity COMMAND window_gemm_parity)

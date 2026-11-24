@@ -5,6 +5,7 @@
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
+#include "basalt/kernels/mhc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -77,6 +78,32 @@ const void* wnorm(Model& m, const uint16_t* x, const float* w, float* xn, int ty
     }
     kernels::rms_norm_rows(x, w, xn, T, cols, eps, s);
     return wact(m, xn, type, cols, T, s);
+}
+// An mHC sublayer (Layer::hc) reads its input from the residual rows like any other, then the rows are zeroed once its norm
+// has read them: the output projection's add (in fp32, rounded once) leaves its output alone there, bf16(out), for
+// hc2_merge.
+void branch_out(uint16_t* x, int64_t rows, int H, cudaStream_t s) { cudaMemsetAsync(x, 0, (size_t) rows * H * sizeof(uint16_t), s); }
+// One layer of `rows` rows in the BF16 residual x: its mixer then its FFN, around each an mHC router and merge when the
+// layer has hyper-connections (the streams xs, the coefficients hc).
+template <class MixerFn, class FfnFn>
+void run_layer(const Model& m, const Layer& L, uint16_t* x, uint16_t* xs, float* hc, int rows, cudaStream_t s, MixerFn mixer,
+               FfnFn ffn) {
+    if (!L.hc.attn_w) {
+        mixer();
+        ffn();
+        return;
+    }
+    const int H = m.g.n_embd;
+    kernels::Hc2Args a;
+    a.n_embd = H;
+    a.iters = m.g.hc_iters;
+    a.pre_scale = m.g.hc_pre_scale;
+    kernels::hc2_pre(xs, x, L.hc.enter, L.hc.attn_w, L.hc.attn_b, rows, a, hc, x, s);
+    mixer();
+    kernels::hc2_merge(xs, x, hc, rows, H, false, x, s);
+    kernels::hc2_pre(xs, x, false, L.hc.ffn_w, L.hc.ffn_b, rows, a, hc, x, s);
+    ffn();
+    kernels::hc2_merge(xs, x, hc, rows, H, L.hc.leave, x, s);
 }
 // the window's first rows: the embedding (BF16 in the pack) into the BF16 residual, exactly
 void embed_rows(Model& m, const int32_t* tok, int T, cudaStream_t s) {
@@ -277,6 +304,7 @@ void win_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.q.type, H, T, g.eps, s);
+    if (L.hc.attn_w) branch_out(b.x, T, H, s);
     prod_group(m, b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, T, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
                              pos, s, 256, true, 0, b.pos0, q8, far_kv);
@@ -291,6 +319,7 @@ void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStre
     WindowScratch& b = m.ws;
     const int H = g.n_embd, C = g.conv_channels();
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.qkv.type, H, T, g.eps, s);
+    if (L.hc.attn_w) branch_out(b.x, T, H, s);
     float* qkv = st.rec_qkv + (size_t) gi * kWindow * C;
     prod_group(m, b.xn, xq, L.qkv.type, {{&L.qkv, qkv}, {&L.z, b.z}}, T, s);
     kernels::DecRecArgs a = gdn_args(m, L);
@@ -310,6 +339,7 @@ void win_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
     const void* xq = wnorm(m, b.x, L.ffn_norm, b.xn, L.gate.type, H, T, g.eps, s);
+    if (L.hc.ffn_w) branch_out(b.x, T, H, s);
     if (on_wg(L.down.type)) {   // h straight into the down product's bf16 rows
         prod_swiglu(m, L.gate, L.up, b.xn, xq, nullptr, T, s, b.hq);
         prod_add(m, L.down, b.hq, b.x, T, s);
@@ -423,6 +453,7 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         };
         if (f8) prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, nullptr, s);
         else prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
+        if (L.hc.attn_w) branch_out(residual(b), T, H, s);
         if (cells_only) {
             if (f8) {
                 const prefill::fp8::Segment seg[2] = {f8_seg(L.k, b.k), f8_seg(L.v, b.v)};
@@ -465,6 +496,7 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         return;
     }
     kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
+    if (L.hc.attn_w) branch_out(residual(b), T, H, s);
     if (cells_only) {
         chunk_act(m, b.xn, L.k.type, H, T, s);
         gemm(m, L.k, b.k, T, s);
@@ -506,6 +538,7 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
             prefill::fp4_dense::product_bf16(L.qkv.w, L.qkv.scale, L.qkv.rows, H, b.a4, b.gs, T, bf(b.qkv), L.qkv.rows, s);
             prefill::fp4_dense::product_bf16(L.z.w, L.z.scale, L.z.rows, H, b.a4, b.gs, T, bf(b.z), L.z.rows, s);
         }
+        if (L.hc.attn_w) branch_out(residual(b), T, H, s);
         kernels::gdn_gating_proj(bf(b.xn), L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
         kernels::gdn_conv(hist, bf(b.qkv), L.conv, bf(b.hc), T, s, HV);
         if (f8) {
@@ -521,6 +554,7 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
     }
     {
         kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
+        if (L.hc.attn_w) branch_out(residual(b), T, H, s);
         chunk_act(m, b.xn, L.qkv.type, H, T, s);
         gemm(m, L.qkv, b.qkv, T, s);
         if (L.z.type != L.qkv.type) chunk_act(m, b.xn, L.z.type, H, T, s);
@@ -543,6 +577,7 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
         // added by down's; H is BF16 (in b.h's buffer), read once by its quantizer
         uint16_t* h16 = reinterpret_cast<uint16_t*>(b.h);
         prefill::fp4_dense::rms_norm_quantize(residual(b), L.ffn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
+        if (L.hc.ffn_w) branch_out(residual(b), T, H, s);
         prefill::fp4_dense::swiglu(L.gate.w, L.up.w, L.gate.scale, L.up.scale, L.gate.rows, H, b.a4, b.gs, T, h16, g.n_ff, s,
                                    b.hmax);
         prefill::fp4_dense::quantize_amax(h16, b.hmax, T, g.n_ff, g.n_ff, b.a4, b.gs, s);
@@ -550,6 +585,7 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
         return;
     }
     kernels::rms_norm_rows(residual(b), L.ffn_norm, b.xn, T, H, g.eps, s);
+    if (L.hc.ffn_w) branch_out(residual(b), T, H, s);
     chunk_act(m, b.xn, L.gate.type, H, T, s);
     gemm(m, L.gate, b.g, T, s);
     if (L.up.type != L.gate.type) chunk_act(m, b.xn, L.up.type, H, T, s);
@@ -665,14 +701,15 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
     kernels::PdlScope pdl(true);   // the window gemm and its packs start early: their weights are read meanwhile
     if (m.lb == 0) embed_rows(m, b.tok, T, s);
     window_layers(m, T, st.dacc, [&](int il) {
-        const Layer& L = w.layers[(size_t) il];
-        if (L.kind == Mixer::Gdn) {
-            win_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
-        } else {
-            const int ai = m.attn_index[(size_t) il];
-            win_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], st.far_kv[(size_t) ai]);
-        }
-        win_ffn(m, L, T, s);
+        const Layer& L = w.layers[(size_t) g.layer_of(il)];
+        run_layer(m, L, b.x, b.xs, b.hcoef, T, s, [&] {
+            if (L.kind == Mixer::Gdn) {
+                win_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
+            } else {
+                const int ai = m.attn_index[(size_t) il];
+                win_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], st.far_kv[(size_t) ai]);
+            }
+        }, [&] { win_ffn(m, L, T, s); });
     }, s);
     if (m.lb > 0) return;   // the second card of a split has no head
     prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, T, g.eps, s), st.logits, T, s);
@@ -753,6 +790,7 @@ void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, i
     WindowScratch& b = m.ws;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim, KV = g.n_kv * g.head_dim;
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.q.type, H, rows, g.eps, s);
+    if (L.hc.attn_w) branch_out(b.x, rows, H, s);
     prod_group(m, b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, rows, s);
     // each segment's queries and cache cells, then every segment's attention in one launch
     int row = 0;
@@ -785,6 +823,7 @@ void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int S, in
     WindowScratch& b = m.ws;
     const int H = g.n_embd, C = g.conv_channels();
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.qkv.type, H, rows, g.eps, s);
+    if (L.hc.attn_w) branch_out(b.x, rows, H, s);
     kernels::DecRecArgs a = gdn_args(m, L);
     a.qkv = b.rq;
     // the gates once per row and head (they read b.xn only), beside the qkv/z product
@@ -833,10 +872,11 @@ void batch_body(Model& m, const BatchSeg* segs, int S) {
         if (m.lb == 0) embed_rows(m, b.tok, rows, s);
         // the block drafter's features packed in b.dacc until every session has its own
         window_layers(m, rows, b.dacc, [&](int il) {
-            const Layer& L = w.layers[(size_t) il];
-            if (L.kind == Mixer::Gdn) batch_gdn(m, L, m.gdn_index[(size_t) il], segs, S, rows, max_n, s);
-            else batch_attn(m, L, m.attn_index[(size_t) il], segs, S, rows, s);
-            win_ffn(m, L, rows, s);
+            const Layer& L = w.layers[(size_t) g.layer_of(il)];
+            run_layer(m, L, b.x, b.xs, b.hcoef, rows, s, [&] {
+                if (L.kind == Mixer::Gdn) batch_gdn(m, L, m.gdn_index[(size_t) il], segs, S, rows, max_n, s);
+                else batch_attn(m, L, m.attn_index[(size_t) il], segs, S, rows, s);
+            }, [&] { win_ffn(m, L, rows, s); });
         }, s);
         if (m.lb > 0) return;   // the second card of a split has no head
         prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, rows, g.eps, s), b.hl, rows, s);
@@ -945,7 +985,7 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
     const auto prefetch_from = [&](int il0) {
         if (m.stage.at >= pos) return;
         for (int j = il0; j < l1; ++j)
-            if (w.layers[(size_t) j].kind == Mixer::Attention) {
+            if (g.kinds[(size_t) j] == Mixer::Attention) {
                 if (j < g.n_layers - 1 || last_read) stage_prefetch(m, st.far_kv[(size_t) m.attn_index[(size_t) j]], pos, s);
                 return;
             }
@@ -955,17 +995,26 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
     if (taps)
         while (next_target < taps->target_layers.size() && taps->target_layers[next_target] < l0) ++next_target;
     for (int il = l0; il < l1; ++il) {
-        const Layer& L = w.layers[(size_t) il];
-        const bool unread = il == g.n_layers - 1 && !last_read;
-        if (L.kind == Mixer::Gdn) {
-            chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
-        } else {
-            const int ai = m.attn_index[(size_t) il];
-            chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread, st.far_kv[(size_t) ai]);
-            if (!unread) prefetch_from(il + 1);
+        const Layer& L = w.layers[(size_t) g.layer_of(il)];
+        const bool unread = il == g.n_layers - 1 && !last_read && !L.hc.attn_w;
+        if (unread) {   // the cells alone (an attention layer; a GDN layer's state needs its whole mixer)
+            if (L.kind == Mixer::Gdn) {
+                chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
+            } else {
+                const int ai = m.attn_index[(size_t) il];
+                chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], true, st.far_kv[(size_t) ai]);
+            }
+            break;
         }
-        if (unread) break;
-        chunk_ffn(m, L, T, s);
+        run_layer(m, L, residual(m.cs), m.cs.xs, m.cs.hcoef, T, s, [&] {
+            if (L.kind == Mixer::Gdn) {
+                chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
+            } else {
+                const int ai = m.attn_index[(size_t) il];
+                chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], false, st.far_kv[(size_t) ai]);
+                prefetch_from(il + 1);
+            }
+        }, [&] { chunk_ffn(m, L, T, s); });
         if (taps && next_target < taps->target_layers.size() && taps->target_layers[next_target] == il)
             chunk_tap(m, st, T, *taps, next_target++);
     }

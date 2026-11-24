@@ -49,6 +49,13 @@ struct Layer {
     const float *q_norm = nullptr, *k_norm = nullptr;
     // FFN
     Linear gate, up, down;
+    /// Two-stream hyper-connections (mHC) around the layer's mixer and FFN, null without: per sublayer an fp32 router
+    /// [8][2 n_embd] (pre 2, post 2, mix 2x2 as mix[dst][src]) and its bias [8] (kernels/mhc.hpp, hc2_pre and hc2_merge).
+    /// `enter`: the layer opens the streams from the residual (each stream a copy); `leave`: it closes them into their mean.
+    struct Hc {
+        const float *attn_w = nullptr, *attn_b = nullptr, *ffn_w = nullptr, *ffn_b = nullptr;
+        bool enter = false, leave = false;
+    } hc;
 };
 
 /// The drafter layer a pack may carry (multi-token prediction): fc(concat(norm_e(embed(next)), norm_h(hidden))),
@@ -87,7 +94,17 @@ struct Geometry {
     int gdn_state = 0, gdn_k_heads = 0, gdn_v_heads = 0, gdn_conv = 0;
     kernels::GdnGate gdn_gate = kernels::GdnGate::Silu;
     float eps = 1e-6f;
-    std::vector<Mixer> kinds;
+    std::vector<Mixer> kinds;            ///< per layer visit
+    /// A looped model: per layer visit (the layers a token runs through, in order; n_layers of them) the stored layer whose
+    /// weights it runs (Weights::layers holds the stored layers).  Each visit keeps its own cells and recurrent state.
+    /// Empty: visit il runs layer il.
+    std::vector<int> physical;
+    int layer_of(int il) const { return physical.empty() ? il : physical[(size_t) il]; }
+    /// The stored layers (Weights::layers' size).
+    int stored_layers() const;
+    /// Hyper-connections (Layer::hc): their streams (0 none, else 2), Sinkhorn iterations and the branch's scale.
+    int hc_streams = 0, hc_iters = 20;
+    float hc_pre_scale = 1.0f;
     int64_t context_length = 0;          ///< the longest context the model supports
     int gdn_layers() const;
     int attn_layers() const;

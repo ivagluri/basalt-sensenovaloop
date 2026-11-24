@@ -58,6 +58,8 @@ struct BatchTable {
 /// The decode window's scratch (kBatch rows).
 struct WindowScratch {
     uint16_t* x = nullptr;                       // the residual rows, BF16 (every add in fp32, rounded once)
+    uint16_t* xs = nullptr;                      // a model with hyper-connections: the streams [kBatch][2][n_embd] (BF16)
+    float* hcoef = nullptr;                      // and a sublayer's coefficients [kBatch][kHc2Coef]
     float *xn = nullptr, *tmp = nullptr;
     void* xq = nullptr;                          // the window gemm's activations (bf16 rows)
     void* hq = nullptr;                          // the down product's (SwiGLU's bf16 rows)
@@ -87,6 +89,8 @@ struct WindowScratch {
 /// The prompt chunk's scratch (kChunk rows), its mixer and FFN buffers sharing memory.
 struct ChunkScratch {
     float *x = nullptr, *xn = nullptr, *tmp = nullptr;
+    uint16_t* xs = nullptr;                       // hyper-connections: the streams [kChunk][2][n_embd] (BF16)
+    float* hcoef = nullptr;                       // and a sublayer's coefficients [kChunk][kHc2Coef]
     void* xq = nullptr;                           // MMQ activations
     float *qkv = nullptr, *z = nullptr, *hc = nullptr, *gate = nullptr, *beta = nullptr, *ab = nullptr;
     float *y = nullptr, *yn = nullptr;
