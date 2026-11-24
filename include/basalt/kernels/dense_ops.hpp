@@ -35,7 +35,7 @@ void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64
 /// (K a multiple of 16).
 void f32_rows_dot(const float* x, const float* w, float* y, int64_t T, int64_t N, int64_t K, void* stream);
 /// The GDN a/b projections of a prompt chunk with the gates fused: w_ab BF16 [2 HV][K] (the a rows, then the b rows),
-/// gate[t][h] = softplus(a + dt[h]) * ssm_a[h], beta[t][h] = sigmoid(b).  Replaces bf16_rows_dot + gdn_gates (HV = 48, K % 512 == 0).
+/// gate[t][h] = softplus(a + dt[h]) * ssm_a[h], beta[t][h] = sigmoid(b).  Replaces bf16_rows_dot + gdn_gates (HV 48 or 32, K % 512 == 0).
 void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
                      int64_t T, int64_t HV, int64_t K, void* stream);
 /// As gdn_gating_proj, of BF16 rows (exact: one BF16 term).

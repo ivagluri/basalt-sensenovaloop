@@ -577,6 +577,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/gdn_window.cu
                         src/kernels/cuda/gdn_commit.cu
                         src/kernels/cuda/gdn_prompt.cu
+                        src/kernels/cuda/gdn_prompt_hv32.cu
                         src/kernels/cuda/dense_ops.cu
                         src/kernels/cuda/gqa_attn.cu
                         src/kernels/cuda/nvfp4_planes.cu
@@ -981,6 +982,11 @@ add_executable(gdn_seg_split_parity tests/kernels/gdn_seg_split_parity.cpp)
 target_link_libraries(gdn_seg_split_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gdn_seg_split_parity COMMAND gdn_seg_split_parity)
 set_tests_properties(gdn_seg_split_parity PROPERTIES SKIP_RETURN_CODE 77)
+# the prompt GDN kernels at each value-head count (48, 32) against a double-precision CPU reference
+add_executable(gdn_heads_parity tests/kernels/gdn_heads_parity.cpp)
+target_link_libraries(gdn_heads_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME gdn_heads_parity COMMAND gdn_heads_parity)
+set_tests_properties(gdn_heads_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 add_executable(window_gemm_parity tests/kernels/window_gemm_parity.cpp)
 target_link_libraries(window_gemm_parity PRIVATE window_gemm kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME window_gemm_parity COMMAND window_gemm_parity)

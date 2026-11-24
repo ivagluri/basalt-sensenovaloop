@@ -8,7 +8,7 @@
 // value is the one the per-stage kernels produce (the same operations on the same values in the same order), so a
 // token's outputs do not depend on T or its column.  Needs thread-block clusters.
 //
-// Geometry: state size 128; key and value heads, the block width (a multiple of 256 up to 5120) and the output
+// Geometry: state size 128; key and value heads, the block width (2560, 4096 or 5120) and the output
 // gate's activation (GdnGate) are the model's.  State layout [S rows][h_v][S cols] fp32, then the conv history
 // [C][3]; value head h meets key head h % h_k.
 #pragma once

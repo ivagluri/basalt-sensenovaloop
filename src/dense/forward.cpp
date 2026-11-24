@@ -507,15 +507,15 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
             prefill::fp4_dense::product_bf16(L.z.w, L.z.scale, L.z.rows, H, b.a4, b.gs, T, bf(b.z), L.z.rows, s);
         }
         kernels::gdn_gating_proj(bf(b.xn), L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
-        kernels::gdn_conv(hist, bf(b.qkv), L.conv, bf(b.hc), T, s);
+        kernels::gdn_conv(hist, bf(b.qkv), L.conv, bf(b.hc), T, s, HV);
         if (f8) {
             kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
-                                         (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD));
+                                         (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD), nullptr, nullptr, HV);
             chunk_residual_f8(m, L.out, T, s);
             return;
         }
         kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
-                                     nullptr, nullptr, bf(b.yn), b.hmax);
+                                     nullptr, nullptr, bf(b.yn), b.hmax, HV);
         chunk_residual_fp4(m, L.out, bf(b.yn), b.hmax, VD, T, s);
         return;
     }
@@ -527,8 +527,9 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
         gemm(m, L.z, b.z, T, s);
     }
     kernels::gdn_gating_proj(b.xn, L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
-    kernels::gdn_conv(hist, b.qkv, L.conv, b.hc, T, s);
-    kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn);
+    kernels::gdn_conv(hist, b.qkv, L.conv, b.hc, T, s, HV);
+    kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn, nullptr,
+                            nullptr, HV);
     chunk_residual(m, L.out, b.yn, VD, T, s);
 }
 
