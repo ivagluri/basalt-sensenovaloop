@@ -50,9 +50,9 @@ void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, c
 struct RopeSpec {
     int rot = 0;
     float theta = 0.0f;
-    int8_t axis[64] = {};      // per rotated pair
+    int8_t axis[128] = {};     // per rotated pair (up to a whole 256-wide head's 128)
     RopeScaling scaling;       // its freq_base is theta's
-    float inv_freq[64] = {};   // filled by attn_qk_prepare from theta, rot and scaling (the kernels read the table)
+    float inv_freq[128] = {};  // filled by attn_qk_prepare from theta, rot and scaling (the kernels read the table)
     float mscale = 1.0f;       // likewise: the magnitude correction
 };
 
