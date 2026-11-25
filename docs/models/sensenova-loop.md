@@ -1,8 +1,8 @@
 # SenseNova-Loop-9B (in progress)
 
 A dense model with a loop. Runs with the same command as any model: `basalt serve PACK`. Status: it converts, loads and
-serves (chat, tools, thinking, the MTP drafter) on one card; there is no published pack, no measured quality against BF16
-yet, and no NVFP4 pack. What is checked so far is below.
+serves (chat, tools, thinking, the MTP drafter) on one card, from the BF16 checkpoint (Q8_0) or a ModelOpt NVFP4 one;
+there is no published pack, and the quality numbers below are a first look (two chunks). What is checked so far is below.
 
 ## Pack
 
@@ -65,6 +65,26 @@ On an RTX 5070 Ti, the Q8_0 pack:
   with the MTP drafter 55 to 100 tokens/s in the server.
 - The server: answers, a tool call, thinking on and off.
 
-Not yet: `basalt-bench --quality` against a BF16 base (llama.cpp's port in pull request 32588 shares one KV cache between a
-layer's visits at its current head, so its BF16 GGUF is not the reference), an NVFP4 pack, images and video against the
-reference, parallel slots.
+## Quality against BF16
+
+The base is the reference model itself: transformers 5.18 with the checkpoint's remote code, FP32 arithmetic on the BF16
+weights (as llama.cpp's CPU path computes a BF16 GGUF), wikitext-2 test in 512-token chunks, the second half scored, written
+in llama.cpp's KL-divergence base format. llama.cpp's port (pull request 32588) is not used: at its current head it gives a
+looped attention layer one KV cache for both visits. Two chunks (510 rows), so the numbers are a first look, not the gate's
+100:
+
+| Pack | Size | On the card | PPL (base 11.922) | Mean KLD | Same top-1 |
+| --- | --- | --- | --- | --- | --- |
+| Q8_0 from BF16 (`--head q8`) | 10.9 GiB | 8.6 GiB | 11.912 | 0.0032 | 98.24% |
+| Kaleto's NVFP4-MLP ([Kaleto/SenseNova-Loop-9B-NVFP4-MLP](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4-MLP)), converted as it is | 8.2 GiB | 5.4 GiB | 11.956 | 0.0905 | 87.45% |
+| Kaleto's NVFP4 ([Kaleto/SenseNova-Loop-9B-NVFP4](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4)), converted as it is | 7.2 GiB | 4.2 GiB | 12.097 | 0.1396 | 86.67% |
+
+The Q8_0 pack is within Q8_0's own rounding of the reference. The NVFP4 builds lose what their quantization loses (Kaleto
+reports 0.094 and 0.153 to 0.160 mean KLD for them on their own method); both have an NVFP4 head. Both convert with the
+same command (`--checkpoint` on the ModelOpt checkpoint). A better NVFP4 pack (a BF16 head as FP8 rows, calibration over
+both visits of the loop) is not made yet.
+
+Speed on the RTX 5070 Ti, 256 greedy tokens after a short prompt: Q8_0 45 tokens/s (`--spec 0`) and 89 (`--spec 3`); NVFP4
+84 and 155; NVFP4-MLP 65 and 129. A 1,499-token prompt reads in 375 ms (Q8_0), 116 ms (NVFP4) and 193 ms (NVFP4-MLP).
+
+Not yet: the 100-chunk gate, images and video against the reference, parallel slots.
