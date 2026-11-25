@@ -26,16 +26,19 @@ namespace {
 
 constexpr const char* kArea = "basalt sensenova_loop";
 
-// The dense stack's options for a run of these flags (the pack's MTP layer, when drafting).
+// The dense stack's options for a run of these flags (when drafting, the pack's DFlash 2 block drafter, else its MTP layer).
 dense::Options run_options(const GgufFile& gg, const model::LoadRequest& req) {
-    bool mtp = false;
-    for (const TensorInfo& t : gg.tensors()) mtp |= t.name == "mtp.fc.weight";
+    bool mtp = false, block = false;
+    for (const TensorInfo& t : gg.tensors()) {
+        mtp |= t.name == "mtp.fc.weight";
+        block |= t.name == "dflash.fc.0.weight";
+    }
     dense::Options o;
     o.max_context = req.max_context;
     o.sessions = req.sessions;
     o.spec = req.spec;
-    o.draft = req.draft && mtp;
-    o.drafter = o.draft ? dense::Drafter::Mtp : dense::Drafter::None;
+    o.draft = req.draft && (mtp || block);
+    o.drafter = !o.draft ? dense::Drafter::None : block ? dense::Drafter::Block : dense::Drafter::Mtp;
     o.vision = req.vision;
     o.kv_int8 = req.kv == "int8" || req.kv == "nvfp4";
     o.kv_fp4 = req.kv == "nvfp4";
@@ -105,9 +108,11 @@ private:
         const int file = plan_.file(path);
         reader_ = std::make_unique<dense::PackReader>(gg, "sensenova_loop", plan_, file);
         dense::PackReader& r = *reader_;
-        const bool mtp = o.drafter == dense::Drafter::Mtp;
-        if (!r.reserve([&](const std::string& n) { return n.starts_with("blk.") || n.starts_with("output") || (mtp && n.starts_with("mtp.")); },
-                       err))
+        const bool mtp = o.drafter == dense::Drafter::Mtp, block = o.drafter == dense::Drafter::Block;
+        if (!r.reserve([&](const std::string& n) {
+                return n.starts_with("blk.") || n.starts_with("output") || (mtp && n.starts_with("mtp.")) ||
+                       (block && n.starts_with("dflash."));
+            }, err))
             return false;
         dense::Weights w;
         const int H = g.n_embd;
@@ -128,13 +133,15 @@ private:
             w.layers.push_back(L);
         }
         if (mtp && !r.mtp(g, w.mtp, err)) return false;
+        if (block && !r.block_drafter(g, kArch, w.dflash, err)) return false;
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         basalt::log::info(kArea, "%zu tensors, %.2f GiB on the GPU, %.2f GiB of embedding in page-locked RAM; %.2f GiB free; "
-                          "%d stored layers, %d visits (layers %d-%d run %d times), hyper-connections over layers %d-%d",
+                          "%d stored layers, %d visits (layers %d-%d run %d times), hyper-connections over layers %d-%d%s",
                           r.count(), (double) r.device_bytes() / 1073741824.0, (double) r.host_bytes() / 1073741824.0,
                           (double) free_b / 1073741824.0, (int) loop.stored.size(), g.n_layers, loop.start, loop.end - 1, loop.count,
-                          loop.hc_start, loop.hc_end - 1);
+                          loop.hc_start, loop.hc_end - 1,
+                          block ? "; drafting with the DFlash 2 block drafter" : mtp ? "; drafting with the MTP layer" : "");
         o.host_embedding_bytes = r.host_bytes();
         o.gpu_weight_bytes = r.device_bytes();
         if (o.vision) {
@@ -145,7 +152,8 @@ private:
             o.mmproj = srcs.vision;
         }
         const uint64_t need_b = dense::shared_bytes(g, o.max_context, o.kv_format(), o.kv_resident) +
-                                (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, mtp, o.kv_format(), o.kv_resident);
+                                (uint64_t) o.sessions * (dense::session_bytes(g, o.max_context, mtp, o.kv_format(), o.kv_resident) +
+                                                         (block ? dense::block_session_bytes(g, w.dflash, o.max_context) : 0));
         if (const uint64_t host_b = dense::session_host_bytes(g, o.max_context, o.kv_format(), o.kv_resident))
             basalt::log::info(kArea, "K/V streaming: %lld of %lld cells per attention visit in VRAM, %.2f GiB in page-locked RAM per slot",
                               (long long) dense::resident_cells(o.max_context, o.kv_resident), (long long) o.max_context,
@@ -196,12 +204,13 @@ public:
         return true;
     }
 
-    // the pack's MTP layer drafts windows of up to 3 unless --spec says otherwise (0 or 1: plain decode).  Each MTP draft reads
-    // the whole head, and past the second position few drafts are kept: on an RTX 5070 Ti, 128 greedy tokens of the Q8_0
-    // pack took 1.43 s at --spec 3, 1.48 s at 4, 1.63 s at 2, 2.74 s without drafting and 2.76 s at 16.
+    // Unless --spec says otherwise (0 or 1: plain decode): the pack's DFlash 2 block drafter drafts windows of up to
+    // kBlockSpec, else its MTP layer windows of up to kMtpSpec.  Each MTP draft reads the whole head, and past the second
+    // position few drafts are kept: on an RTX 5070 Ti, 128 greedy tokens of the Q8_0 pack took 1.43 s at --spec 3, 1.48 s at
+    // 4, 1.63 s at 2, 2.74 s without drafting and 2.76 s at 16.
     int planned_spec(const program::CommonOptions& o) const override {
         if (o.spec_given) return o.spec >= 2 ? o.spec : 0;
-        return has_drafter(o.model) ? kDefaultSpec : 0;
+        return default_spec(o.model);
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
@@ -222,8 +231,8 @@ public:
             basalt::log::error(kArea, "--spec %d: 0 (off) to 16", o.spec);
             return 2;
         }
-        if (!o.spec_given) o.spec = has_drafter(o.model) ? kDefaultSpec : 0;
-        if (o.spec >= 2 && !has_drafter(o.model)) {
+        if (!o.spec_given) o.spec = default_spec(o.model);
+        if (o.spec >= 2 && default_spec(o.model) == 0) {
             basalt::log::warn(kArea, "--spec %d off: the pack has no drafter layer", o.spec);
             o.spec = 0;
         }
@@ -231,13 +240,15 @@ public:
     }
 
 private:
-    static constexpr int kDefaultSpec = 3;
-    static bool has_drafter(const std::string& path) {
+    static constexpr int kMtpSpec = 3, kBlockSpec = 8;
+    // the window the pack's drafter fills by default: kBlockSpec with a block drafter, kMtpSpec with the MTP layer, else 0
+    static int default_spec(const std::string& path) {
         core::ModelFile file;
         std::string err;
-        if (path.empty() || !file.open(path, err) || !file.load_meta(err)) return false;
+        if (path.empty() || !file.open(path, err) || !file.load_meta(err)) return 0;
         const core::Json* t = file.meta().get("tensors");
-        return t != nullptr && t->get("mtp.fc.weight") != nullptr;
+        if (t == nullptr) return 0;
+        return t->get("dflash.fc.0.weight") ? kBlockSpec : t->get("mtp.fc.weight") ? kMtpSpec : 0;
     }
     const char* model_name() const override { return "SenseNova-Loop-9B"; }
 };

@@ -128,7 +128,10 @@ python3 tools/convert/convert.py --checkpoint quasar --drafter dflash2 --out Qwe
   amax / 6): 0.72 GB instead of 1.27 GB, nine times the squared error ([precision](precision/qwen38-27b.md#quality-against-bf16)).
 - `vision/mmproj`: the BF16 tower written as llama.cpp's clip GGUF (`qwen3vl_merger`); `vision/text_vocab` beside it.
 - The drafter's feature projection is stored as one block per target layer (`dflash.fc.N`), so the engine projects each
-  layer's rows as the layer ends. 19.7 GiB with the drafter (21,149,505,930 bytes, SHA-256
+  layer's rows as the layer ends. A drafter that also reads the target's final normed rows (`target_feature_sources` ending
+  in `final_postnorm`) has one more block, the last, and `<arch>.dflash.feature.final_norm` true; its layers over the whole
+  context (`layer_types` `full_attention`) are listed in `<arch>.dflash.full_attention_layers`. Its target layers are layer
+  visits in execution order (a looped model's loop layers count once per pass). 19.7 GiB with the drafter (21,149,505,930 bytes, SHA-256
   `5ec89e71b4bd461a5abf607825d3cd99e74d2476b8ba087fd690f09a067919ba` for the published file); about a minute on the default
   16 converter processes. The engine refuses a 27B pack whose MLP and head are NVFP4 in ggml blocks (type 40, before
   NVFP4_PLANES) and asks for a re-conversion.

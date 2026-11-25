@@ -15,6 +15,7 @@
 #include "basalt/kernels/gdn_window.hpp"
 #include "basalt/model/adapter.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -70,21 +71,42 @@ struct Mtp {
 /// A block drafter (DFlash 2): the target's rows at a few layers, projected and normed, are the context (K/V in a
 /// sliding window) of a few non-causal attention layers that read a block [anchor, mask, ...] and give every slot's
 /// candidates at once; a selector walks one path through them.  The head is the target's.
+/// A drafter may also read the target's final normed rows (the head's input) as a last feature, and have layers that attend
+/// the whole context instead of the window; such a drafter runs on one card (one_card()).
 struct BlockDrafter {
     struct Layer {
         const float *attn_norm = nullptr, *ffn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr;
         const float *base_a = nullptr, *base_f = nullptr;   // the two convolutions' base kernels [2][2][n_embd]
         Linear q, k, v, o, gate, up, down, conv_a, conv_f;
+        bool full = false;                   ///< attends the whole context (else the window's)
     };
     bool present = false;
     int block = 0, mask_id = 0, conv_group = 0, rank = 0, top_k = 0, window = 0;
     int n_head = 0, n_kv = 0, head_dim = 0;
     float theta = 0.0f, eps = 1e-6f;
-    std::vector<int> target_layers;          ///< the target layers whose outputs it reads, in order
-    std::vector<Linear> fc;                  ///< per target layer, its block of the feature projection
+    std::vector<int> target_layers;          ///< the target layer visits whose outputs it reads, in order
+    bool final_norm = false;                 ///< then the target's final normed rows
+    std::vector<Linear> fc;                  ///< per feature, its block of the feature projection
     const float *hidden_norm = nullptr, *norm = nullptr;
     std::vector<Layer> layers;
     const uint16_t *sel_h = nullptr, *pred = nullptr, *succ = nullptr;   // bf16 [rank][n_embd], [vocab][rank] x 2
+
+    /// Cells layer l's context ring holds for a context of `max_context`: the window's and a block's, or the whole context's.
+    int64_t ring_cells(size_t l, int64_t max_context) const {
+        return (layers[l].full ? max_context : (int64_t) window) + 256;
+    }
+    /// The largest ring.
+    int64_t widest_ring(int64_t max_context) const {
+        int64_t w = (int64_t) window + 256;
+        for (size_t l = 0; l < layers.size(); ++l) w = std::max(w, ring_cells(l, max_context));
+        return w;
+    }
+    /// Whether it reads the final rows or attends whole contexts: a split or prompt stage does not carry those.
+    bool one_card() const {
+        bool full = false;
+        for (const Layer& L : layers) full |= L.full;
+        return final_norm || full;
+    }
 };
 
 struct Geometry {
@@ -197,8 +219,8 @@ uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, int
 uint64_t session_host_bytes(const Geometry& g, int64_t max_context, int kv, int64_t kv_resident);
 /// Device bytes the model's shared scratch takes (with streaming, the VRAM copy a prompt chunk reads one layer's far cells from).
 uint64_t shared_bytes(const Geometry& g, int64_t max_context, int kv = 0, int64_t kv_resident = 0);
-/// Device bytes a session's block drafter keeps (its context ring and its window rows); 0 without one.
-uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd);
+/// Device bytes a session's block drafter keeps (its context rings and its window rows); 0 without one.
+uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_context);
 /// What a two-card layer split divides for `o` (its sessions, context and drafter): per layer its weights (`layer_weights`)
 /// and every slot's cells and state there; per card what it holds whatever its layers: the main card `main_weights` (head,
 /// norms, drafter), the shared scratch, each slot's rest and the hand-off buffers, the second card its scratch and landing

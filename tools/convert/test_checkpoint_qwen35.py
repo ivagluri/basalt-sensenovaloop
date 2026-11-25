@@ -720,5 +720,66 @@ class Qwen35RefusalTest(unittest.TestCase):
             self.assertIsInstance(bad, str)
 
 
+class LoopDrafterTest(unittest.TestCase):
+    """A DFlash 2 drafter for a looped model (SenseNova-Loop-9B-DFlash2's config): target layers are layer visits, the
+    target's final normed rows a fifth feature, the last layer over the whole context; Drafter reads headers only."""
+
+    LOOP = {"start": 4, "end": 28, "eval_count": 2, "counts": [2]}
+
+    def drafter(self, edit=None, arch="sensenova_loop"):
+        cfg = {"architectures": ["DFlash2DraftModel"], "hidden_size": H, "vocab_size": VOCAB, "num_hidden_layers": 5,
+               "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64, "intermediate_size": FF,
+               "rms_norm_eps": 1e-6, "rope_parameters": {"rope_theta": 1e7}, "is_causal": False, "sliding_window": 2048,
+               "num_target_layers": 56, "layer_types": ["sliding_attention"] * 4 + ["full_attention"],
+               "target_feature_sources": [3, 27, 51, 54, "final_postnorm"],
+               "dflash_config": {"block_size": 8, "conv_kernel_size": 2, "conv_group_size": 16, "selector_rank": 32,
+                                 "selector_top_k": 16, "target_layer_ids": [3, 27, 51, 54], "mask_token_id": 7}}
+        if edit:
+            edit(cfg)
+        n = len(cfg.get("target_feature_sources") or cfg["dflash_config"]["target_layer_ids"])
+        ck = type("Ck", (), {"config": {"model_type": arch, "loop_settings": self.LOOP},
+                             "text": {"hidden_size": H, "vocab_size": VOCAB, "num_hidden_layers": 32}})()
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "config.json").write_text(json.dumps(cfg))
+            write_safetensors(d / "model.safetensors", {
+                "fc.weight": ("BF16", [H, H * n], bytes(H * H * n * 2)),
+                "hidden_norm.weight": ("BF16", [H], bytes(H * 2))})
+            return Q.Drafter(d, ck)
+
+    def test_visits_final_norm_and_full_layer(self):
+        dr = self.drafter()
+        self.assertEqual(sorted(n for n in dr.tensors if n.startswith("dflash.fc.")), [f"dflash.fc.{j}.weight" for j in range(5)])
+        self.assertEqual(dr.slices["dflash.fc.4.weight"], (4 * H, 5 * H))
+        kv = dr.kv()
+        self.assertEqual(kv["sensenova_loop.dflash.target_layers"], [3, 27, 51, 54])
+        self.assertIs(kv["sensenova_loop.dflash.feature.final_norm"], True)
+        self.assertEqual(kv["sensenova_loop.dflash.full_attention_layers"], [4])
+
+    def test_plain_drafter_keys_unchanged(self):
+        def plain(c):
+            c["layer_types"] = ["sliding_attention"] * 5
+            del c["target_feature_sources"]
+        kv = self.drafter(plain).kv()
+        self.assertNotIn("sensenova_loop.dflash.feature.final_norm", kv)
+        self.assertNotIn("sensenova_loop.dflash.full_attention_layers", kv)
+
+    def test_refusals(self):
+        def bad_order(c):
+            c["target_feature_sources"] = ["final_postnorm", 3, 27, 51, 54]
+        def past_visits(c):
+            c["dflash_config"]["target_layer_ids"] = [3, 27, 51, 56]
+            c["target_feature_sources"] = [3, 27, 51, 56, "final_postnorm"]
+        def causal(c):
+            c["is_causal"] = True
+        def other_type(c):
+            c["layer_types"][0] = "linear_attention"
+        for edit in (bad_order, past_visits, causal, other_type):
+            with self.assertRaises(S.ConvertError, msg=edit.__name__):
+                self.drafter(edit)
+        with self.assertRaises(S.ConvertError):   # 54 is past a 32-layer model without the loop
+            self.drafter(arch="qwen3_5")
+
+
 if __name__ == "__main__":
     unittest.main()

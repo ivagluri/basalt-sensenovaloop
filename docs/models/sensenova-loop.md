@@ -1,7 +1,7 @@
 # SenseNova-Loop-9B (in progress)
 
 A dense model with a loop. Runs with the same command as any model: `basalt serve PACK`. Status: it converts, loads and
-serves (chat, tools, thinking, the MTP drafter) on one card, from the BF16 checkpoint (Q8_0) or a ModelOpt NVFP4 one;
+serves (chat, tools, thinking, the official DFlash 2 drafter or the MTP layer) on one card, from the BF16 checkpoint (Q8_0) or a ModelOpt NVFP4 one;
 there is no published pack, and the quality numbers below are a first look (two chunks). What is checked so far is below.
 
 ## Pack
@@ -10,9 +10,13 @@ Build it from the BF16 checkpoint ([sensenova/SenseNova-Loop-9B](https://hugging
 Apache-2.0):
 
 ```sh
-python3 tools/convert/convert.py --checkpoint SenseNova-Loop-9B --head q8 --name "SenseNova-Loop-9B Q8_0" \
-    --out SenseNova-Loop-9B-Q8_0.basalt
+python3 tools/convert/convert.py --checkpoint SenseNova-Loop-9B --drafter SenseNova-Loop-9B-DFlash2 --head q8 \
+    --name "SenseNova-Loop-9B Q8_0 DFlash2" --out SenseNova-Loop-9B-Q8_0-DFlash2.basalt
 ```
+
+`--drafter` adds the official block drafter ([sensenova/SenseNova-Loop-9B-DFlash2](https://huggingface.co/sensenova/SenseNova-Loop-9B-DFlash2),
+Apache-2.0, measured against the checkpoint's revision `3cc220e9`) as `dflash.*` tensors; without it the pack drafts with
+its MTP layer. 12.0 GiB with the drafter, 10.9 GiB without.
 
 - Every projection (GDN, attention, MLP, the MTP layer and with `--head q8` the head) Q8_0 from BF16; without `--head`
   the head becomes FP8 rows with a scale per row.
@@ -46,11 +50,31 @@ need some layers on both cards.
 
 ## Drafting
 
-The checkpoint's MTP layer, on by default with `--spec 3`. Each MTP draft reads the whole head, and past the second position
-few drafts are kept; on an RTX 5070 Ti (Q8_0 pack, greedy, 128 tokens): `--spec 3` 1.43 s, `--spec 4` 1.48 s, `--spec 2`
-1.63 s, `--spec 0` 2.74 s, `--spec 16` 2.76 s. Drafted output is plain decoding's, token for token. The official DFlash 2
-drafter (`sensenova/SenseNova-Loop-9B-DFlash2`) reads the final norm's output as a fifth feature and has a full-attention
-last layer; neither is in the block drafter yet.
+With a block drafter in the pack (`--drafter` above), the official DFlash 2 drafter, on by default with `--spec 8` (its
+trained block). Five layers (967M parameters, its projections NVFP4 at load as for the 27B's drafter) read the target's
+rows after layer visits 3, 27, 51 and 54 and, as a fifth feature, the target's final normed rows (the head's input); the
+first four layers attend a 2,048-position window, the last the whole context, as it was trained (SenseSpec's per-layer
+masks). LightLLM's integration windows every layer; on a long prompt the whole-context layer keeps about two more tokens a
+window (below). Its context ring holds the whole context (about 0.5 GiB a slot at 128K cells); a checkpointed conversation
+keeps its last 2,304 cells, so after a restore that layer reads as far back as the others until the conversation grows.
+
+On an RTX 5070 Ti, Q8_0 pack, greedy, 256 tokens (`basalt generate`), output identical to `--spec 0` in every row, `--kv
+fp16` and `int8` alike:
+
+| Prompt | `--spec 0` | DFlash 2 `--spec 8` | tokens a window | MTP `--spec 3` |
+| --- | ---: | ---: | ---: | ---: |
+| a coding request (49 tokens) | 5.50 s | 1.56 s | 4.11 | 2.71 s |
+| 1,500 tokens | 5.54 s | 1.92 s | 3.48 | |
+| 4,756 tokens | 5.60 s | 1.22 s | 5.53 | 2.69 s |
+| 4,756 tokens, the last layer windowed | | 2.02 s | 3.32 | |
+
+`--spec 12` and `16` give the same times as 8; `--spec 6` is slower (1.65 s, 1.39 s). A draft costs about 2.7 ms, a verify
+window about 22.5 ms (one plain token about 21.5 ms). With sampling (temperature 1.0) fewer drafts are kept.
+
+Without a block drafter, the checkpoint's MTP layer, on by default with `--spec 3`. Each MTP draft reads the whole head, and
+past the second position few drafts are kept; on an RTX 5070 Ti (Q8_0 pack, greedy, 128 tokens): `--spec 3` 1.43 s,
+`--spec 4` 1.48 s, `--spec 2` 1.63 s, `--spec 0` 2.74 s, `--spec 16` 2.76 s. Drafted output is plain decoding's, token
+for token.
 
 ## What is checked
 

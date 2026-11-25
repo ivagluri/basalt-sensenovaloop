@@ -4,7 +4,7 @@
 //
 // The tensor names are the dense packs' GGUF names: blk.N.{attn_norm, post_attention_norm, attn_qkv, attn_gate, ssm_out,
 // ssm_alpha, ssm_beta, ssm_dt.bias, ssm_a, ssm_conv1d, ssm_norm, attn_q, attn_k, attn_v, attn_output, attn_q_norm,
-// attn_k_norm, ffn_gate, ffn_up, ffn_down, hc_attn_fn, hc_ffn_fn}, output, output_norm, token_embd, mtp.*.
+// attn_k_norm, ffn_gate, ffn_up, ffn_down, hc_attn_fn, hc_ffn_fn}, output, output_norm, token_embd, mtp.*, dflash.*.
 #pragma once
 
 #include "basalt/artifact/gguf_reader.hpp"
@@ -53,6 +53,9 @@ public:
     bool layer(const Geometry& g, int il, Mixer kind, Layer& L, std::string& err);
     /// The MTP drafter layer (mtp.*).
     bool mtp(const Geometry& g, Mtp& d, std::string& err);
+    /// The DFlash 2 block drafter (dflash.* tensors, its shape from `<prefix>.dflash.*`): its target layer visits, the
+    /// final-norm feature (feature.final_norm) and the layers over the whole context (full_attention_layers) when it has them.
+    bool block_drafter(const Geometry& g, const std::string& prefix, BlockDrafter& d, std::string& err);
     bool has(const std::string& name) const { return tensors_.count(name) != 0; }
     uint64_t device_bytes() const { return dev_bytes_; }
     uint64_t host_bytes() const { return host_bytes_; }

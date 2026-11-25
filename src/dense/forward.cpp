@@ -651,6 +651,15 @@ void win_tap(Model& m, size_t j, const uint16_t* rows16, float* dacc, int T, cud
     prod(m, fc, xq, j == 0 ? dacc : m.ws.tmp, T, s);
     if (j > 0) kernels::add_scaled(dacc, m.ws.tmp, nullptr, (int64_t) T * m.g.n_embd, s);
 }
+// The block drafter's last feature when it reads one: the target's final normed rows (`xn`, the head's input) through the
+// projection's last block, added into `dacc`.
+void win_tap_final(Model& m, const float* xn, float* dacc, int T, cudaStream_t s) {
+    const BlockDrafter& bd = m.bd_dec;
+    if (m.o.drafter != Drafter::Block || !bd.final_norm) return;
+    const Linear& fc = bd.fc[bd.target_layers.size()];
+    prod(m, fc, wact(m, xn, fc.type, fc.cols, T, s), m.ws.tmp, T, s);
+    kernels::add_scaled(dacc, m.ws.tmp, nullptr, (int64_t) T * m.g.n_embd, s);
+}
 
 // A window's layers [m.lb, m.le) of `rows` rows in m.ws.x, the drafter's features of its target layers into `dacc`; on a layer
 // split, the window's first rows from the main card (the second card's model) and its later layers' rows from the second
@@ -713,6 +722,7 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
     }, s);
     if (m.lb > 0) return;   // the second card of a split has no head
     prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, T, g.eps, s), st.logits, T, s);
+    win_tap_final(m, b.xn, st.dacc, T, s);
     if (st.hid) cudaMemcpyAsync(st.hid, b.xn, (size_t) T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);   // the drafter's
 }
 
@@ -880,6 +890,7 @@ void batch_body(Model& m, const BatchSeg* segs, int S) {
         }, s);
         if (m.lb > 0) return;   // the second card of a split has no head
         prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, rows, g.eps, s), b.hl, rows, s);
+        win_tap_final(m, b.xn, b.dacc, rows, s);
     }
     int row = 0;
     for (int k = 0; k < S; row += segs[k++].T) {
@@ -978,7 +989,8 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
     // a drafter: the MTP history takes every row's final hidden state, a block drafter the rows of its target layers.
     // When neither reads them, the last layer leaves only what the session keeps: an attention layer its cells; its FFN
     // is not run.
-    const bool last_read = read_last || st.mtp_kc != nullptr ||
+    const bool final_tap = taps && taps->final_norm && l1 == g.n_layers;
+    const bool last_read = read_last || st.mtp_kc != nullptr || final_tap ||
                            (taps && std::find(taps->target_layers.begin(), taps->target_layers.end(), g.n_layers - 1) !=
                                         taps->target_layers.end());
     // K/V streaming: the next attention layer that attends gets its earlier far cells staged meanwhile
@@ -1018,6 +1030,15 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
         if (taps && next_target < taps->target_layers.size() && taps->target_layers[next_target] == il)
             chunk_tap(m, st, T, *taps, next_target++);
     }
+    if (final_tap) {   // the target's final normed rows, the drafter's last feature
+        ChunkScratch& b = m.cs;
+        const int H = g.n_embd;
+        const Linear& fc = taps->fc[taps->target_layers.size()];
+        kernels::rms_norm_rows(residual(b), w.out_norm, b.xn, T, H, g.eps, s);
+        chunk_act(m, b.xn, fc.type, H, T, s);
+        gemm(m, fc, b.tmp, T, s);
+        kernels::add_scaled(b.dacc, b.tmp, nullptr, (int64_t) T * H, s);
+    }
 }
 
 void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size_t j) {
@@ -1047,7 +1068,7 @@ void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64
         gemm(m, D.k, b.k, n, s);
         gemm(m, D.v, b.v, n, s);
         kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, D.k_norm, bd.eps, rope, b.pos, n, 0, bd.n_kv, nullptr,
-                                 st.dk[l], st.dv[l], pos, s, bd.head_dim, false, st.dctx_cap);
+                                 st.dk[l], st.dv[l], pos, s, bd.head_dim, false, st.dcap[l]);
     }
 }
 
@@ -1097,7 +1118,7 @@ bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::strin
         const BlockDrafter::Layer& D = bd.layers[l];
         prod_group(m, b.xn, xq, D.k.type, {{&D.k, b.bk}, {&D.v, b.bv}}, n, s);
         kernels::attn_qk_prepare(nullptr, b.bk, b.bv, nullptr, D.k_norm, bd.eps, rope, b.bpos, n, 0, bd.n_kv, nullptr,
-                                 st.dk[l], st.dv[l], pos, s, bd.head_dim, false, st.dctx_cap);
+                                 st.dk[l], st.dv[l], pos, s, bd.head_dim, false, st.dcap[l]);
     }
     return cuda_ok("block drafter context", err);
 }
@@ -1166,10 +1187,13 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
             const int B = widths[k];
             kernels::attn_qk_prepare(b.bq + q0 * AQ, b.bk + q0 * KV, b.bv + q0 * KV, D.q_norm, D.k_norm, bd.eps, rope,
                                      b.bpos + q0 * 3, B, bd.n_head, bd.n_kv, b.bqo + q0 * AQ, st.dk[l], st.dv[l], pos[k], s,
-                                     bd.head_dim, false, st.dctx_cap);
-            const int64_t window = std::min<int64_t>(bd.window, pos[k] - st.dctx_from + 1);   // context below dctx_from is gone
+                                     bd.head_dim, false, st.dcap[l]);
+            // context below dctx_from is gone; a windowed layer's row t reads the window before its own position, a
+            // full-attention layer's rows all read from dctx_from (and the whole block, as any layer)
+            const int64_t back = pos[k] - st.dctx_from + 1;
+            const int64_t window = D.full ? back : std::min<int64_t>(bd.window, back);
             kernels::gqa_window_attn(b.bqo + q0 * AQ, st.dk[l], st.dv[l], bd.n_head, bd.n_kv, bd.head_dim, pos[k], B, pos[k] + B,
-                                     window, st.dctx_cap, b.battn, st.dctx_cap, b.bao + q0 * AQ, s);
+                                     window, st.dcap[l], b.battn, st.dcap[l], b.bao + q0 * AQ, s, D.full);
         }
         prod(m, D.o, wact(m, b.bao, D.o.type, AQ, R, s), b.tmp, R, s);
         conv(b.tmp, b.dyn + 2 * groups, D.conv_a.rows, D.base_a + 2 * H);

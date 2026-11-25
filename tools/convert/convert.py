@@ -66,7 +66,8 @@ From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoi
                      projections keep their codes and scales, FP8 ones their E4M3 codes, NVFP4 GDN a / b become BF16 of
                      their values, a BF16 head becomes FP8 E4M3 rows, the drafter's BF16 projections Q8_0, the vision
                      tower an mmproj GGUF; tokenizer and metadata from the checkpoint's files. Everything comes from DIR.
-  --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
+  --drafter DIR      a DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2, sensenova/SenseNova-Loop-9B-DFlash2),
+                     added as dflash.* tensors
   --head fp8|nvfp4|q8  a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448, the default), rounded once
                      to NVFP4 (UE4M3 scale of least squared error per 16 values) or to Q8_0; a head already NVFP4 is kept
   A BF16 checkpoint (every projection BF16) becomes Q8_0 projections. A SenseNova Loop checkpoint (model_type

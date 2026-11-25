@@ -41,8 +41,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
     size_t blockbytes = 0;
     if (block) {
         const BlockDrafter& bd = m.w.dflash;
-        blockbytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
-                      (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
+        blockbytes = block_session_bytes(g, bd, m.o.max_context);
     }
     const uint64_t dev_bytes = session_bytes(g, m.o.max_context, mtp, m.o.kv_format(), m.o.kv_resident, m.lb, m.le);
     if (!st.arena.reserve(dev_bytes + blockbytes)) {
@@ -133,8 +132,9 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         const BlockDrafter& bd = m.w.dflash;
         st.dctx_cap = bd.window + 256;
         for (size_t l = 0; l < bd.layers.size(); ++l) {
-            st.dk.push_back(st.arena.take<uint16_t>((size_t) st.dctx_cap * bd.n_kv * bd.head_dim));
-            st.dv.push_back(st.arena.take<uint16_t>((size_t) st.dctx_cap * bd.n_kv * bd.head_dim));
+            st.dcap.push_back(bd.ring_cells(l, m.o.max_context));
+            st.dk.push_back(st.arena.take<uint16_t>((size_t) st.dcap.back() * bd.n_kv * bd.head_dim));
+            st.dv.push_back(st.arena.take<uint16_t>((size_t) st.dcap.back() * bd.n_kv * bd.head_dim));
         }
         st.dacc = st.arena.take<float>((size_t) kWindow * g.n_embd);
         st.dids = st.arena.take<int32_t>(kWindow);
@@ -517,7 +517,21 @@ public:
     // same position finds every cell where it was; `valid` says how many cells below the position are this
     // conversation's.
     static constexpr size_t kHeadBytes = 4 * sizeof(int64_t);
+    // (A full-attention layer's ring holds the whole context; the state keeps its last dctx_cap cells, so after a restore
+    // that layer reads as much context as a windowed one until the conversation grows.)
     size_t block_ring_bytes() const { return (size_t) st_.dctx_cap * m_.w.dflash.n_kv * m_.w.dflash.head_dim * sizeof(uint16_t); }
+    // ring `p` (layer l's K or V): the slots of cells [pos - dctx_cap, pos) (from 0 while pos is below), in one or two parts
+    void ring_regions(uint16_t* p, size_t l, int64_t pos, core::RunningState& s) const {
+        const int64_t cap = st_.dcap[l], n = st_.dctx_cap;
+        const size_t row = (size_t) m_.w.dflash.n_kv * m_.w.dflash.head_dim;
+        if (cap == n) {
+            s.regions.push_back({p, block_ring_bytes()});
+            return;
+        }
+        const int64_t s0 = std::max<int64_t>(pos - n, 0) % cap, first = std::min<int64_t>(n, cap - s0);
+        s.regions.push_back({p + (size_t) s0 * row, (size_t) first * row * sizeof(uint16_t)});
+        if (first < n) s.regions.push_back({p, (size_t) (n - first) * row * sizeof(uint16_t)});
+    }
     size_t running_bytes() const override {
         return kHeadBytes + (size_t) (m_.n_gdn + (st_.peer ? m_.split_model->n_gdn : 0)) * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
                (block_ ? st_.dk.size() * 2 * block_ring_bytes() : 0);
@@ -538,8 +552,8 @@ public:
         if (drafter_) s.regions.push_back({st_.tail, (size_t) g_.n_embd * 4});
         if (block_)
             for (size_t l = 0; l < st_.dk.size(); ++l) {
-                s.regions.push_back({st_.dk[l], block_ring_bytes()});
-                s.regions.push_back({st_.dv[l], block_ring_bytes()});
+                ring_regions(st_.dk[l], l, pos, s);
+                ring_regions(st_.dv[l], l, pos, s);
             }
         s.stream = st_.stream;
         s.peer_regions.clear();

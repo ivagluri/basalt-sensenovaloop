@@ -78,11 +78,11 @@ namespace {
 
 // bytes of the decode window's scratch
 // the block drafter's rows in the window scratch
-size_t block_scratch_floats(const Geometry& g, const BlockDrafter& bd) {
+size_t block_scratch_floats(const Geometry& g, const BlockDrafter& bd, int64_t max_context) {
     if (!bd.present) return 0;
     const size_t W = kBatch, AQ = (size_t) bd.n_head * bd.head_dim, KV = (size_t) bd.n_kv * bd.head_dim;
     return W * (3 * AQ + 2 * KV + bd.layers[0].conv_a.rows + g.n_embd + kernels::kLogprobStride + bd.rank + 3) +
-           kernels::gqa_decode_scratch_floats(bd.window + 256, kBatch, bd.n_head, bd.head_dim) + 64 * 64;
+           kernels::gqa_decode_scratch_floats(bd.widest_ring(max_context), kBatch, bd.n_head, bd.head_dim) + 64 * 64;
 }
 
 int64_t widest_input(const Geometry& g) {
@@ -145,7 +145,7 @@ size_t window_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_conte
     if (g.attn_layers() > 0) f += kernels::gqa_decode_scratch_floats(max_context, kBatch, g.n_head);
     f += W * (2 * (size_t) g.conv_channels() + 2 * (size_t) g.gdn_v_heads) + (sizeof(BatchTable) + 3) / 4;
     f += W * 2 * H + kernels::row_logprobs_scratch_floats(kBatch, g.n_vocab) + W * g.value_width() + W * (size_t) g.n_vocab;
-    f += block_scratch_floats(g, bd);
+    f += block_scratch_floats(g, bd, max_context);
     size_t wp, wt;
     wgemm_need(g, wp, wt);
     const size_t hc = g.hc_streams ? W * 2 * H * 2 + W * kernels::kHc2Coef * 4 + 2 * 256 : 0;   // the streams, coefficients
@@ -369,10 +369,11 @@ uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, int kv,
     return b + drafter + (uint64_t) kWindow * g.n_vocab * 4;
 }
 
-uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd) {
+uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd, int64_t max_context) {
     if (!bd.present) return 0;
-    return bd.layers.size() * 2 * (uint64_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 + (uint64_t) kWindow * (g.n_embd * 4 + 16) +
-           64 * 256;
+    uint64_t rings = 0;
+    for (size_t l = 0; l < bd.layers.size(); ++l) rings += 2 * (uint64_t) bd.ring_cells(l, max_context) * bd.n_kv * bd.head_dim * 2;
+    return rings + (uint64_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
 }
 
 model::SplitSpec split_spec(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
@@ -387,7 +388,7 @@ model::SplitSpec split_spec(const Geometry& g, const Options& o, const BlockDraf
         layers += per_slot;
     }
     const uint64_t slot_rest = session_bytes(g, o.max_context, mtp, o.kv_format(), o.kv_resident) - layers +
-                               (o.drafter == Drafter::Block ? block_session_bytes(g, bd) : 0);
+                               (o.drafter == Drafter::Block ? block_session_bytes(g, bd, o.max_context) : 0);
     const uint64_t scratch = shared_bytes(g, o.max_context, o.kv_format(), o.kv_resident);
     s.fixed = {main_weights + scratch + slots * slot_rest + stage_main_bytes(g, bd),
                scratch + 2ull * kChunk * g.n_embd * 2};   // the second card: its own scratch and the landing residuals
@@ -647,7 +648,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         b.blp = a.take<float>(W * kernels::kLogprobStride);
         b.bsel = a.take<float>(W * bd.rank);
         b.bpos = a.take<int32_t>(W * 3);
-        b.battn = a.take<float>(kernels::gqa_decode_scratch_floats(bd.window + 256, kBatch, bd.n_head, bd.head_dim));
+        b.battn = a.take<float>(kernels::gqa_decode_scratch_floats(bd.widest_ring(o.max_context), kBatch, bd.n_head, bd.head_dim));
     }
     b.y = a.take<float>(W * g.value_width());
     b.hl = a.take<float>(W * (size_t) g.n_vocab);

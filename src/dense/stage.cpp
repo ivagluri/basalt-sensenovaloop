@@ -400,6 +400,10 @@ bool plan_prompt_split(Model& m, int dev, int l_min, const Weights& w, std::stri
         err = "a looped model or one with hyper-connections reads its prompts on one card";
         return false;
     }
+    if (m.o.drafter == Drafter::Block && w.dflash.one_card()) {
+        err = "a block drafter that reads the final rows or attends whole contexts reads its prompts on one card";
+        return false;
+    }
     if (m.o.max_context <= 2 * (int64_t) kChunk) {
         basalt::log::info("basalt dense", "prompt split: off (a context of %lld holds no prompt over %d tokens)", (long long) m.o.max_context,
                           2 * kChunk);
@@ -643,6 +647,10 @@ void PeerStateDeleter::operator()(SessionState* s) const {
 bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err) {
     if (!m.g.physical.empty() || m.g.hc_streams) {
         err = "a looped model or one with hyper-connections runs on one card";
+        return false;
+    }
+    if (m.o.drafter == Drafter::Block && m.w.dflash.one_card()) {
+        err = "a block drafter that reads the final rows or attends whole contexts runs on one card";
         return false;
     }
     const Geometry& g = m.g;

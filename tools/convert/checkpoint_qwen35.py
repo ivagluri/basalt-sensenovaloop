@@ -716,10 +716,31 @@ class Drafter:
         dc = self.config["dflash_config"]
         if int(self.config["hidden_size"]) != int(ck.text["hidden_size"]) or int(self.config["vocab_size"]) != int(ck.text["vocab_size"]):
             raise S.ConvertError(f"{self.dir}: the drafter's width or vocabulary differs from the model's")
-        if any(t >= int(ck.text["num_hidden_layers"]) for t in dc["target_layer_ids"]):
-            raise S.ConvertError(f"{self.dir}: a target layer past the model's layers")
-        if self.config.get("is_causal") is not False or set(self.config.get("layer_types", [])) != {"sliding_attention"}:
-            raise S.ConvertError(f"{self.dir}: only the non-causal sliding-window drafter is converted")
+        # the target layers are layer visits, in execution order (a loop's layers count once per pass)
+        visits = int(ck.text["num_hidden_layers"])
+        if self.arch == LOOP_ARCH:
+            loop = ck.config["loop_settings"]
+            visits += (int(loop["eval_count"]) - 1) * (int(loop["end"]) - int(loop["start"]))
+        self.targets = [int(t) for t in dc["target_layer_ids"]]
+        if not self.targets or self.targets != sorted(set(self.targets)) or self.targets[0] < 0:
+            raise S.ConvertError(f"{self.dir}: target_layer_ids {self.targets}: distinct layers in order")
+        if self.targets[-1] >= visits or int(self.config.get("num_target_layers", visits)) != visits:
+            raise S.ConvertError(f"{self.dir}: the drafter reads {self.config.get('num_target_layers')} layers; the model runs {visits}")
+        # the features: the target layers' rows, then optionally the target's final normed rows (final_postnorm)
+        sources = self.config.get("target_feature_sources")
+        if sources is None or list(sources) == self.targets:
+            self.final_norm = False
+        elif list(sources) == self.targets + ["final_postnorm"]:
+            self.final_norm = True
+        else:
+            raise S.ConvertError(f"{self.dir}: target_feature_sources {sources}: the target layers, optionally then final_postnorm")
+        # non-causal blocks; each layer windowed (sliding_attention) or over the whole context (full_attention)
+        types = list(self.config.get("layer_types", []))
+        if self.config.get("is_causal") is not False or len(types) != int(self.config["num_hidden_layers"]) or \
+                not set(types) <= {"sliding_attention", "full_attention"} or int(self.config.get("sliding_window") or 0) <= 0:
+            raise S.ConvertError(f"{self.dir}: only the non-causal drafter of sliding-window and full-attention layers is converted")
+        self.full = [i for i, t in enumerate(types) if t == "full_attention"]
+        n_features = len(self.targets) + self.final_norm
         self.files, self.t = sorted(self.dir.glob("*.safetensors")), {}
         for f in self.files:
             head, base = S.read_safetensors_header(f)
@@ -729,10 +750,10 @@ class Drafter:
         self.tensors, self.slices = {}, {}
         H = int(self.config["hidden_size"])
         for k, (f, off, dt, shape, n) in self.t.items():
-            if k == "fc.weight":   # one [H][H] block per target layer, so the features project as each layer ends
-                if shape != [H, H * len(dc["target_layer_ids"])]:
+            if k == "fc.weight":   # one [H][H] block per feature, so the features project as each layer ends
+                if shape != [H, H * n_features]:
                     raise S.ConvertError(f"{self.dir}: fc.weight is {shape}")
-                for j in range(len(dc["target_layer_ids"])):
+                for j in range(n_features):
                     name = f"dflash.fc.{j}.weight"
                     self.tensors[name] = Tensor(name, "Q8", k, "id", [H, H])
                     self.slices[name] = (j * H, shape[1])
@@ -750,7 +771,9 @@ class Drafter:
         c, dc = self.config, self.config["dflash_config"]
         A = self.arch + ".dflash."
         return {A + "block_count": int(c["num_hidden_layers"]), A + "block_size": int(dc["block_size"]),
-                A + "mask_token_id": int(dc["mask_token_id"]), A + "target_layers": [int(x) for x in dc["target_layer_ids"]],
+                A + "mask_token_id": int(dc["mask_token_id"]), A + "target_layers": self.targets,
+                **({A + "feature.final_norm": True} if self.final_norm else {}),
+                **({A + "full_attention_layers": self.full} if self.full else {}),
                 A + "conv_kernel": int(dc["conv_kernel_size"]), A + "conv_group": int(dc["conv_group_size"]),
                 A + "selector_rank": int(dc["selector_rank"]), A + "selector_top_k": int(dc["selector_top_k"]),
                 A + "sliding_window": int(c["sliding_window"]), A + "attention.head_count": int(c["num_attention_heads"]),

@@ -273,4 +273,75 @@ bool PackReader::mtp(const Geometry& g, Mtp& d, std::string& err) {
     return true;
 }
 
+bool PackReader::block_drafter(const Geometry& g, const std::string& prefix, BlockDrafter& d, std::string& err) {
+    const std::string A = prefix + ".dflash.";
+    const auto u = [&](const char* k) { const MetaValue* v = gg_.get(A + k); return v ? (int) v->u : 0; };
+    const auto f = [&](const char* k) { const MetaValue* v = gg_.get(A + k); return v ? (float) v->num() : 0.0f; };
+    const int H = g.n_embd, layers = u("block_count"), ff = u("feed_forward_length");
+    d = BlockDrafter{};
+    d.block = u("block_size");
+    d.mask_id = u("mask_token_id");
+    d.conv_group = u("conv_group");
+    d.rank = u("selector_rank");
+    d.top_k = u("selector_top_k");
+    d.window = u("sliding_window");
+    d.n_head = u("attention.head_count");
+    d.n_kv = u("attention.head_count_kv");
+    d.head_dim = u("attention.key_length");
+    d.theta = f("rope.freq_base");
+    d.eps = f("attention.layer_norm_rms_epsilon");
+    d.final_norm = u("feature.final_norm") != 0;
+    if (const MetaValue* t = gg_.get(A + "target_layers"))
+        for (const MetaValue& x : t->items) d.target_layers.push_back((int) x.u);
+    bool ordered = !d.target_layers.empty() && d.target_layers.back() < g.n_layers;
+    for (size_t j = 1; j < d.target_layers.size(); ++j) ordered = ordered && d.target_layers[j - 1] < d.target_layers[j];
+    if (d.block < 2 || d.block > 8 || !ordered || u("conv_kernel") != 2 || d.n_kv <= 0 || d.n_head % d.n_kv ||
+        (d.head_dim != 128 && d.head_dim != 256) || d.top_k < 2 || d.top_k > 20 || d.conv_group <= 0 || H % d.conv_group ||
+        d.window <= 0 || layers <= 0 || ff <= 0 || d.rank <= 0) {
+        err = area_ + ": the pack's block drafter has a shape the engine does not run";
+        return false;
+    }
+    d.layers.resize((size_t) layers);
+    if (const MetaValue* t = gg_.get(A + "full_attention_layers"))
+        for (const MetaValue& x : t->items) {
+            if (x.u >= (uint64_t) layers) {
+                err = area_ + ": the block drafter's full_attention_layers name a layer it does not have";
+                return false;
+            }
+            d.layers[(size_t) x.u].full = true;
+        }
+    const int AQ = d.n_head * d.head_dim, KV = d.n_kv * d.head_dim, conv = 2 * 2 * (H / d.conv_group);
+    const size_t features = d.target_layers.size() + (d.final_norm ? 1 : 0);
+    for (size_t j = 0; j < features; ++j) {
+        d.fc.emplace_back();
+        if (!linear("dflash.fc." + std::to_string(j), H, H, d.fc.back(), err)) return false;
+    }
+    d.hidden_norm = floats("dflash.hidden_norm.weight", H, err);
+    d.norm = floats("dflash.norm.weight", H, err);
+    if (!d.hidden_norm || !d.norm) return false;
+    for (int l = 0; l < layers; ++l) {
+        const std::string p = "dflash.blk." + std::to_string(l) + ".";
+        BlockDrafter::Layer& L = d.layers[(size_t) l];
+        L.attn_norm = floats(p + "attn_norm.weight", H, err);
+        L.ffn_norm = floats(p + "post_attention_norm.weight", H, err);
+        L.q_norm = floats(p + "attn_q_norm.weight", d.head_dim, err);
+        L.k_norm = floats(p + "attn_k_norm.weight", d.head_dim, err);
+        L.base_a = floats(p + "attn_conv.base", 4 * (int64_t) H, err);
+        L.base_f = floats(p + "ffn_conv.base", 4 * (int64_t) H, err);
+        if (!L.attn_norm || !L.ffn_norm || !L.q_norm || !L.k_norm || !L.base_a || !L.base_f ||
+            !linear(p + "attn_q", AQ, H, L.q, err) || !linear(p + "attn_k", KV, H, L.k, err) ||
+            !linear(p + "attn_v", KV, H, L.v, err) || !linear(p + "attn_output", H, AQ, L.o, err) ||
+            !linear(p + "ffn_gate", ff, H, L.gate, err) || !linear(p + "ffn_up", ff, H, L.up, err) ||
+            !linear(p + "ffn_down", H, ff, L.down, err) || !linear(p + "attn_conv", conv, H, L.conv_a, err) ||
+            !linear(p + "ffn_conv", conv, H, L.conv_f, err))
+            return false;
+    }
+    d.sel_h = bf16("dflash.selector.hidden.weight", (int64_t) d.rank * H, err);
+    d.pred = bf16("dflash.selector.pred", (int64_t) d.rank * g.n_vocab, err);
+    d.succ = bf16("dflash.selector.succ", (int64_t) d.rank * g.n_vocab, err);
+    if (!d.sel_h || !d.pred || !d.succ) return false;
+    d.present = true;
+    return true;
+}
+
 }  // namespace basalt::dense
