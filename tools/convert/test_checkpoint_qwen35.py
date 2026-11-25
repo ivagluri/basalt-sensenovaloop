@@ -679,7 +679,7 @@ class Qwen35RefusalTest(unittest.TestCase):
 
     def test_other_gdn_geometry(self):
         with self.assertRaisesRegex(S.ConvertError, "GDN head geometry"):
-            self.plan(edit=lambda c: c["text_config"].update(linear_num_value_heads=32))
+            self.plan(edit=lambda c: c["text_config"].update(linear_num_value_heads=24))
 
     def test_wrong_model_type(self):
         with self.assertRaisesRegex(S.ConvertError, "qwen3_5_text"):

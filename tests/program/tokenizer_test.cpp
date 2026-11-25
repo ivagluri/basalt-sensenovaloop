@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -16,7 +17,10 @@
 #ifdef BASALT_MODEL_DEEPSEEK41
 #include "models/deepseek41/adapter.hpp"
 #endif
-namespace basalt::program::tokenizer { void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends); }
+namespace basalt::program::tokenizer {
+void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends);
+void pretok_qwen2(const char* text, size_t size, std::vector<size_t>& ends);
+}
 
 using basalt::program::Tokenizer;
 
@@ -28,6 +32,7 @@ constexpr PreTok kJoyai = basalt::models::deepseek41::pretok_joyai;
 constexpr PreTok kJoyai = nullptr;
 #endif
 constexpr PreTok kQwen35 = basalt::program::tokenizer::pretok_qwen35;
+constexpr PreTok kQwen2 = basalt::program::tokenizer::pretok_qwen2;
 }  // namespace
 
 namespace {
@@ -56,6 +61,30 @@ std::string spell(const std::string& raw) {
         else { out += (char) (0xC0 | (cp >> 6)); out += (char) (0x80 | (cp & 0x3F)); }
     }
     return out;
+}
+
+// qwen2's and qwen35's splits where they differ (combining marks) and where they agree; the ends are Python's `regex`
+// module on each split's pattern (qwen2's from SenseNova Loop's tokenizer.json)
+void pretok_marks() {
+    struct Case {
+        const char* text;
+        std::vector<size_t> q2, q35;
+    };
+    const Case cases[] = {
+        {"e\xcc\x81cole", {1, 7}, {7}},
+        {"na\xcc\x83o e\xcc\x81 ", {2, 5, 7, 9, 10}, {5, 9, 10}},
+        {"\xe0\xa4\x95\xe0\xa4\xbf\xe0\xa4\xa4\xe0\xa4\xbe\xe0\xa4\xac x", {3, 9, 15, 17}, {15, 17}},
+        {"a \xcc\x81\xcc\x81" "b", {1, 6, 7}, {1, 7}},
+        {"Hello, world! 123\n\n  x", {5, 6, 12, 13, 14, 15, 16, 17, 19, 20, 22}, {5, 6, 12, 13, 14, 15, 16, 17, 19, 20, 22}},
+    };
+    std::vector<size_t> ends;
+    for (const Case& c : cases) {
+        const size_t n = std::strlen(c.text);
+        kQwen2(c.text, n, ends);
+        CHECK(ends == c.q2);
+        kQwen35(c.text, n, ends);
+        CHECK(ends == c.q35);
+    }
 }
 
 void synthetic() {
@@ -228,6 +257,7 @@ int parity(const std::string& dir, const std::string& golden) {
 
 int main(int argc, char** argv) {
     synthetic();
+    pretok_marks();
     if (failures) return 1;
     if (argc >= 3) return parity(argv[1], argv[2]);
     std::printf("tokenizer_test: synthetic checks passed\n");

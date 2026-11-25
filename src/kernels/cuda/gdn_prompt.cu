@@ -30,7 +30,7 @@ bool gdn_prompt_supported(int state, int k_heads, int v_heads, int conv_taps) {
     return state == 128 && k_heads == 16 && (v_heads == 48 || v_heads == 32) && conv_taps == 4;
 }
 
-// Each entry point runs the kernels of the model's value-head count (48: Qwen3.8 27B and Flash-Next; 32: SenseNova Loop's 9B).
+// Each entry point runs the kernels of the model's value-head count (48 or 32).
 void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream, int v_heads) {
     if (v_heads == 32) gdn_hv32::gates(ab, dt, ssm_a, gate, beta, T, stream);
     else gdn_hv48::gates(ab, dt, ssm_a, gate, beta, T, stream);

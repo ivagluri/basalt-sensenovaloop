@@ -68,7 +68,7 @@ inline size_t hc_plain_workspace_floats(int n_tokens, int n_mix = 8) { return (s
 void hc_mixes_plain(const float* x, const float* hc_fn, const float* hc_scale, const float* hc_base, int n_tokens,
                     int n_mix, const HcPlainArgs& a, float* workspace, float* coef, void* stream);
 
-// ---- two streams, log-space Sinkhorn (SenseNova Loop) ----------------------------------------------------------------
+// ---- two streams, log-space Sinkhorn ----------------------------------------------------------------------------------
 // The streams are BF16 rows [T][2][n_embd].  A sublayer's router is an fp32 linear map W [8][2 n_embd] with bias [8] of the
 // RMS-normalised streams (no norm weight): pre = sigmoid(l[0:2]), post = 2 sigmoid(l[2:4]) and mix = exp of 20 rounds of
 // log-space Sinkhorn on l[4:8] as a 2x2 matrix (mix[dst][src], each round rows then columns).  The roundings are the

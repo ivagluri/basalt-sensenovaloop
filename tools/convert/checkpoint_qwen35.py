@@ -46,6 +46,12 @@ from gguf_writer import GGUFWriter  # noqa: E402
 from model_file import TENSOR_ALIGN, ModelWriter, Stream  # noqa: E402
 
 ARCH = "qwen35"
+LOOP_ARCH = "sensenova_loop"   # SenseNova Loop: the qwen35 layers, a loop over some of them and two-stream hyper-connections
+
+
+def arch_of(ck: C.Checkpoint) -> str:
+    """The pack's architecture: sensenova_loop for a SenseNova Loop checkpoint, else qwen35."""
+    return LOOP_ARCH if ck.config.get("model_type") == LOOP_ARCH else ARCH
 TYPE_ID = {"F32": 0, "F16": 1, "Q8_0": 8, "BF16": 30, "NVFP4": 40, "F8_E4M3": 44, "NVFP4_PLANES": 45}
 ROWS_PER_JOB = 1 << 22
 E4M3 = S.fp8_e4m3_table()
@@ -78,7 +84,13 @@ LAYER = {
     "mlp.gate_proj.weight": ("ffn_gate.weight", "FP4", "id"),
     "mlp.up_proj.weight": ("ffn_up.weight", "FP4", "id"),
     "mlp.down_proj.weight": ("ffn_down.weight", "FP4", "id"),
+    # SenseNova Loop's hyper-connection routers (FP32 [8][2 n_embd] and [8]), the official GGUF's names
+    "mhc_attn.weight": ("hc_attn_fn.weight", "F32", "id"),
+    "mhc_attn.bias": ("hc_attn_fn.bias", "F32", "id"),
+    "mhc_ffn.weight": ("hc_ffn_fn.weight", "F32", "id"),
+    "mhc_ffn.bias": ("hc_ffn_fn.bias", "F32", "id"),
 }
+LOOP_SKIP = {"model.language_model.loop_gate.logits"}   # the loop's gate: unused at a fixed pass count
 GLOBAL = {
     "model.language_model.embed_tokens.weight": ("token_embd.weight", "BF16", "id"),
     "model.language_model.norm.weight": ("output_norm.weight", "F32", "norm"),
@@ -110,14 +122,16 @@ class Plan:
     def __init__(self, ck: C.Checkpoint, head: str | None = None):
         tc = ck.text
         self.ck = ck
+        self.arch = arch_of(ck)
         if tc.get("model_type") != "qwen3_5_text":
             raise S.ConvertError(f"config.json: text model_type {tc.get('model_type')}, expected qwen3_5_text")
         for k in ("num_experts", "hc_count"):
             if k in tc:
                 raise S.ConvertError(f"config.json: {k} is not a dense qwen3_5 field")
-        if int(tc["linear_num_key_heads"]) != S.GDN_K_HEADS or int(tc["linear_num_value_heads"]) != S.GDN_V_HEADS \
+        if int(tc["linear_num_key_heads"]) != S.GDN_K_HEADS or int(tc["linear_num_value_heads"]) not in (48, 32) \
                 or int(tc["linear_key_head_dim"]) != S.GDN_HEAD or int(tc["linear_value_head_dim"]) != S.GDN_HEAD:
-            raise S.ConvertError("the GDN head geometry differs from the GGUF head order this converter knows")
+            raise S.ConvertError("the GDN head geometry differs from the GGUF head order this converter knows "
+                                 "(16 key heads, 48 or 32 value heads, heads of 128)")
         self.tensors: dict[str, Tensor] = {}
         # NVFP4 tensor -> (its tensor-scale source, True when that holds the reciprocal: compressed-tensors'
         # weight_global_scale, Model Optimizer's weight_scale_2 is the scale); F8 tensor -> (its weight_scale, False)
@@ -126,7 +140,7 @@ class Plan:
         self.row_scale: dict[str, np.ndarray] = {}   # F8Q tensor -> its rows' scales (float32)
         unknown = []
         for k in ck.order:
-            if k.startswith("model.visual.") or QUANT_SIDE.search(k):
+            if k.startswith("model.visual.") or QUANT_SIDE.search(k) or (self.arch == LOOP_ARCH and k in LOOP_SKIP):
                 continue
             key = k[:-len("_packed")] if k.endswith(".weight_packed") else k    # compressed-tensors' NVFP4 codes
             m = re.fullmatch(r"model\.language_model\.layers\.(\d+)\.(.+)", key)
@@ -141,6 +155,9 @@ class Plan:
                 unknown.append(k)
                 continue
             gname, form, how = rule[0], rule[1], rule[2]
+            if gname.startswith("hc_") and (self.arch != LOOP_ARCH or mm):
+                unknown.append(k)
+                continue
             gname = name(gname)
             _, _, dt, shape, _ = ck.t[k]
             packed = dt == "U8"
@@ -150,10 +167,13 @@ class Plan:
                 form = "F8"           # FP8 projections keep their codes and scale
             if form == "Q8" and packed and not mm:
                 form = "FP4"          # NVFP4 projections keep their codes and scales
-            if form == "FP4" and dt == "BF16":
-                form = "FP4Q" if head == "nvfp4" else "F8Q"   # a BF16 head: rounded once to FP8 rows or NVFP4
-            elif gname == "output.weight" and head == "fp8":
-                raise S.ConvertError(f"--head fp8 rounds a BF16 head; {k} is {dt}")
+            if form == "FP4" and dt == "BF16" and gname != "output.weight":
+                form = "Q8"           # a BF16 checkpoint's projections: Q8_0
+            elif form == "FP4" and dt == "BF16":
+                # a BF16 head: rounded once to FP8 rows (the default) or NVFP4, or Q8_0
+                form = "FP4Q" if head == "nvfp4" else "Q8" if head == "q8" else "F8Q"
+            elif gname == "output.weight" and head in ("fp8", "q8"):
+                raise S.ConvertError(f"--head {head} rounds a BF16 head; {k} is {dt}")
             if form == "FP4" and not packed:
                 raise S.ConvertError(f"{k} is {dt}; NVFP4 codes are U8")
             cols = shape[1] * 2 if packed and len(shape) == 2 else shape[-1]
@@ -173,7 +193,7 @@ class Plan:
                 raise S.ConvertError(f"{k} is {dt}; projections are read from FP8 or BF16")
             if form == "BF16" and packed and len(shape) != 2:
                 raise S.ConvertError(f"{k}: NVFP4 codes of shape {shape}")
-            if form in ("F32", "BF16") and dt != "BF16" and not (form == "BF16" and packed):
+            if form in ("F32", "BF16") and dt != "BF16" and not (form == "BF16" and packed) and not (form == "F32" and dt == "F32"):
                 raise S.ConvertError(f"{k} is {dt}, expected BF16")
             if gname in self.tensors:
                 raise S.ConvertError(f"two checkpoint tensors map to {gname}")
@@ -209,11 +229,16 @@ class Plan:
                 raise S.ConvertError(f"config.json: layer {l} is {kinds[l]}")
             for key, rule in LAYER.items():
                 part = key.split(".")[0]
-                if part == "linear_attn" and kinds[l] != "linear_attention" or part == "self_attn" and kinds[l] != "full_attention":
+                if part == "linear_attn" and kinds[l] != "linear_attention" or part == "self_attn" and kinds[l] != "full_attention" \
+                        or part.startswith("mhc_"):   # the routers: below, for the layers they span
                     continue
                 need.append(f"blk.{l}.{rule[0]}")
+        if self.arch == LOOP_ARCH:   # the routers of every layer the hyper-connections span
+            mhc = self.ck.config["mhc"]
+            for l in range(int(mhc["start"]), int(mhc["end"])):
+                need += [f"blk.{l}.hc_{p}_fn.{w}" for p in ("attn", "ffn") for w in ("weight", "bias")]
         if int(tc.get("mtp_num_hidden_layers", 0)) == 1:
-            need += [f"mtp.{r[0]}" for k, r in LAYER.items() if not k.startswith("linear_attn")]
+            need += [f"mtp.{r[0]}" for k, r in LAYER.items() if not (k.startswith("linear_attn") or k.startswith("mhc_"))]
         missing = [n for n in need if n not in self.tensors]
         if missing:
             raise S.ConvertError(f"the checkpoint lacks {len(missing)} tensors the engine reads: " + ", ".join(missing[:8]))
@@ -476,16 +501,40 @@ def nvfp4_scale_tiles(sc: np.ndarray) -> np.ndarray:
 
 
 # ------------------------------------------------------------------ metadata
+def loop_kv(ck: C.Checkpoint, A: str) -> dict:
+    """A SenseNova Loop checkpoint's loop and hyper-connection keys, checked: a fixed pass count, two streams, the
+    hyper-connections inside one phase of the loop (the official GGUF's names)."""
+    c, tc = ck.config, ck.text
+    n = int(tc["num_hidden_layers"])
+    loop, mhc = c.get("loop_settings"), c.get("mhc")
+    if not isinstance(loop, dict) or not isinstance(mhc, dict):
+        raise S.ConvertError("config.json: a sensenova_loop checkpoint without loop_settings or mhc")
+    start, end, count = (int(loop[k]) for k in ("start", "end", "eval_count"))
+    if not (0 <= start < end <= n and count >= 1) or loop.get("counts") != [count]:
+        raise S.ConvertError(f"config.json: loop_settings {loop}: a fixed pass count over layers inside the model only")
+    ms, me, streams, iters = (int(mhc[k]) for k in ("start", "end", "streams", "iterations"))
+    scale = float(mhc.get("pre_scale", 1.0))
+    if streams != 2 or iters < 1 or mhc.get("fixed_identity") is not False or not (scale > 0) or \
+            set(mhc) - {"start", "end", "streams", "iterations", "fixed_identity", "pre_scale"}:
+        raise S.ConvertError(f"config.json: mhc {mhc}: two streams with a learnt mix only")
+    if not any(a <= ms < me <= b for a, b in ((0, start), (start, end), (end, n))):
+        raise S.ConvertError("config.json: the hyper-connections cross a phase of the loop")
+    return {A + "loop.start": start, A + "loop.end": end, A + "loop.count": count,
+            A + "mhc.start": ms, A + "mhc.end": me, A + "mhc.streams": streams, A + "mhc.iterations": iters,
+            A + "mhc.fixed_identity": False, A + "mhc.pre_scale": C.f32(scale)}
+
+
 def model_kv(ck: C.Checkpoint, name: str | None) -> dict:
     c, tc = ck.config, ck.text
-    A = ARCH + "."
+    arch = arch_of(ck)
+    A = arch + "."
     d = ck.dir
     gen = json.loads((d / "generation_config.json").read_text(encoding="utf-8")) if (d / "generation_config.json").is_file() else {}
     card = C.front_matter(d / "README.md")
     kinds = tc["layer_types"]
     rope = tc.get("rope_parameters", {})
     head = int(tc["head_dim"])
-    kv = {"general.architecture": ARCH, "general.type": "model"}
+    kv = {"general.architecture": arch, "general.type": "model"}
     if "top_k" in gen:
         kv["general.sampling.top_k"] = int(gen["top_k"])
     if "top_p" in gen:
@@ -535,7 +584,19 @@ def model_kv(ck: C.Checkpoint, name: str | None) -> dict:
         "general.file_type": 40,
         "general.quantization_version": 2,
     })
-    kv.update(C.tokenizer_kv(ck))
+    if rope.get("rope_type", "default") == "yarn":   # YaRN at every position, as the checkpoint is configured
+        orig = int(rope.get("original_max_position_embeddings", 0))
+        if not (float(rope.get("factor", 0)) > 1 and orig > 0):
+            raise S.ConvertError(f"config.json: a YaRN rope without its factor or original context: {rope}")
+        if any(k in rope for k in ("beta_fast", "beta_slow", "attention_factor", "mscale", "mscale_all_dim", "truncate")):
+            raise S.ConvertError(f"config.json: YaRN knobs this converter does not carry: {rope}")
+        kv.update({A + "rope.scaling.type": "yarn", A + "rope.scaling.factor": C.f32(rope["factor"]),
+                   A + "rope.scaling.original_context_length": orig})
+    elif rope.get("rope_type", "default") != "default":
+        raise S.ConvertError(f"config.json: rope_type {rope.get('rope_type')}")
+    if arch == LOOP_ARCH:
+        kv.update(loop_kv(ck, A))
+    kv.update(C.tokenizer_kv(ck, "qwen2", C.QWEN2_HF_SPLIT) if arch == LOOP_ARCH else C.tokenizer_kv(ck))
     return kv
 
 
@@ -649,6 +710,7 @@ class Drafter:
     def __init__(self, d, ck: C.Checkpoint):
         self.dir = pathlib.Path(d)
         self.config = json.loads((self.dir / "config.json").read_text(encoding="utf-8"))
+        self.arch = arch_of(ck)
         if self.config.get("architectures") != ["DFlash2DraftModel"]:
             raise S.ConvertError(f"{self.dir}: not a DFlash2DraftModel")
         dc = self.config["dflash_config"]
@@ -686,7 +748,7 @@ class Drafter:
 
     def kv(self) -> dict:
         c, dc = self.config, self.config["dflash_config"]
-        A = ARCH + ".dflash."
+        A = self.arch + ".dflash."
         return {A + "block_count": int(c["num_hidden_layers"]), A + "block_size": int(dc["block_size"]),
                 A + "mask_token_id": int(dc["mask_token_id"]), A + "target_layers": [int(x) for x in dc["target_layer_ids"]],
                 A + "conv_kernel": int(dc["conv_kernel_size"]), A + "conv_group": int(dc["conv_group_size"]),
@@ -742,7 +804,8 @@ def build(a, Job, fingerprint, die) -> None:
     try:
         ck = C.Checkpoint(a.checkpoint)
         plan = Plan(ck, getattr(a, "head", None))
-        name = a.name or C.front_matter(ck.dir / "README.md").get("base_model", ["Qwen3.5"])[0].split("/")[-1] + " NVFP4"
+        name = a.name or ck.config.get("model_name") or \
+            C.front_matter(ck.dir / "README.md").get("base_model", ["Qwen3.5"])[0].split("/")[-1] + " NVFP4"
         kv = model_kv(ck, name)
         drafter = Drafter(a.drafter, ck) if getattr(a, "drafter", None) else None
         if drafter:
@@ -795,7 +858,7 @@ def build(a, Job, fingerprint, die) -> None:
             used = sorted({t_.how for t_ in plan.tensors.values()})
             lic = kv.get("general.license", "")
             meta = {
-                "format": "basalt", "version": 2, "name": name, "arch": ARCH,
+                "format": "basalt", "version": 2, "name": name, "arch": plan.arch,
                 "converter": {"tool": "tools/convert/convert.py"},
                 "sources": [{"path": p.name, "size": p.stat().st_size,
                              "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)} for p in ck.shards],

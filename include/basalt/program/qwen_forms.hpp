@@ -11,6 +11,8 @@
 namespace basalt::program::tokenizer {
 /// The qwen35 pre-tokenizer: `ends` gets where each piece of the text ends.
 void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends);
+/// The qwen2 pre-tokenizer (Qwen2 / Qwen3's split; SenseNova Loop's): qwen35's with combining marks not joined to letters.
+void pretok_qwen2(const char* text, size_t size, std::vector<size_t>& ends);
 }  // namespace basalt::program::tokenizer
 
 namespace basalt::program {

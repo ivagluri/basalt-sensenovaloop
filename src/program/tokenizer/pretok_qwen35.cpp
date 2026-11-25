@@ -1,4 +1,7 @@
-// src/program/tokenizer/pretok_qwen35.cpp - the qwen35 pre-tokenizer: the text split into the pieces BPE merges.
+// src/program/tokenizer/pretok_qwen35.cpp - the qwen35 pre-tokenizer: the text split into the pieces BPE merges; and the
+// qwen2 one (Qwen2 / Qwen3's split, which SenseNova Loop's tokenizer keeps), the same rules with combining marks not joined
+// to letters:
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 //
 // The splitting rules are those of llama.cpp's unicode_regex_split_custom_qwen35 (src/unicode.cpp at commit f5027fb21,
 // MIT licence, written by Kabir Potdar for llama.cpp pull request 22110; see THIRD_PARTY_LICENSES). They implement
@@ -51,16 +54,16 @@ inline Cp read_cp(const uint8_t* s, size_t size, const uint16_t* table, size_t i
 
 inline uint32_t ascii_lower(uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
-}  // namespace
-
-void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends) {
+// kMarks: qwen35's split (a mark continues a letter run and is not punctuation); else qwen2's (a mark is punctuation)
+template <bool kMarks>
+void pretok_impl(const char* text, size_t size, std::vector<size_t>& ends) {
     ends.clear();
     if (size == 0) return;
     if (ends.capacity() < size / 4 + 16) ends.reserve(size / 4 + 16);
     const uint8_t* s = (const uint8_t*) text;
     const uint16_t* table = cpt_flag_table();
-    constexpr uint16_t kLetterOrMark = kLetter | kMark;
-    constexpr uint16_t kNotPunct = kWhitespace | kLetter | kMark | kNumber;
+    constexpr uint16_t kLetterOrMark = kMarks ? (uint16_t) (kLetter | kMark) : kLetter;
+    constexpr uint16_t kNotPunct = kMarks ? (uint16_t) (kWhitespace | kLetter | kMark | kNumber) : (uint16_t) (kWhitespace | kLetter | kNumber);
 
     size_t prev_end = 0;
     auto add = [&](size_t end) {
@@ -185,5 +188,10 @@ void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends) {
         add(pos);
     }
 }
+
+}  // namespace
+
+void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends) { pretok_impl<true>(text, size, ends); }
+void pretok_qwen2(const char* text, size_t size, std::vector<size_t>& ends) { pretok_impl<false>(text, size, ends); }
 
 }  // namespace basalt::program::tokenizer

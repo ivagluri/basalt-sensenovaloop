@@ -332,12 +332,29 @@ target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/s
 target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision expert_tier tiers mmq peer_share kernels core ${_gpu_runtime_target})
 endif()
 
-if(BASALT_MODEL_QWEN35)
-# The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it; qwen35 is its
-# only model, so the stack is built with it
-add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp)
+if(BASALT_MODEL_QWEN35 OR BASALT_MODEL_SENSENOVA_LOOP)
+# The shared dense stack (hybrid GDN / gated attention layers, dense FFN, optionally a loop and hyper-connections) and
+# its pack reader, built with the models on it (qwen35, sensenova_loop)
+add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp src/dense/pack.cpp)
 target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
 target_link_libraries(dense PUBLIC model kernels window_gemm mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
+endif()
+
+if(BASALT_MODEL_SENSENOVA_LOOP)
+# SenseNova Loop: the qwen35 layers on the dense stack, a loop over some of them and two-stream hyper-connections
+add_library(model_sensenova_loop STATIC src/models/sensenova_loop/adapter.cpp)
+target_include_directories(model_sensenova_loop PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
+target_link_libraries(model_sensenova_loop PUBLIC model tokenizer dense core ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  # the pack's metadata into the dense geometry: the loop's plan and the hyper-connections (host only)
+  add_executable(sensenova_loop_meta_test src/models/sensenova_loop/meta_test.cpp)
+  target_include_directories(sensenova_loop_meta_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(sensenova_loop_meta_test PRIVATE dense warnings)
+  basalt_gpu_test(NAME sensenova_loop_meta_test COMMAND sensenova_loop_meta_test)
+endif()
+endif()
+
+if(BASALT_MODEL_QWEN35)
 add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
 target_include_directories(model_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
 target_link_libraries(model_qwen35 PUBLIC model tokenizer dense core ${_gpu_runtime_target})
@@ -858,7 +875,7 @@ if(BASALT_MODEL_QWEN4EXP)
 target_link_libraries(model_qwen4exp PUBLIC vision_cuda)
 endif()
 target_link_libraries(serve_shared PUBLIC vision_core)
-if(BASALT_MODEL_QWEN35)
+if(BASALT_MODEL_QWEN35 OR BASALT_MODEL_SENSENOVA_LOOP)
   target_link_libraries(dense PUBLIC vision_cuda)
 endif()
 if(BUILD_TESTING)

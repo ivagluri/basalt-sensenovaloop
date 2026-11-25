@@ -34,6 +34,9 @@ UNUSED, NORMAL, CONTROL, USER_DEFINED = 5, 1, 3, 4
 # The pre-tokenizer split of the qwen35 vocabulary as Hugging Face tokenizers writes it.
 QWEN35_HF_SPLIT = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
                    r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+# Qwen2 / Qwen3's split (no \p{M}), which SenseNova Loop's tokenizer keeps: the engine's qwen2 pre-tokenizer
+QWEN2_HF_SPLIT = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
+                  r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
 VALUES_PER_JOB = 1 << 22
 TYPE_ID = {"F32": 0, "F16": 1, "Q8_0": 8, "Q6_K": 14, "BF16": 30}
 E4M3 = S.fp8_e4m3_table()          # a code byte -> its float32 value (the two NaN codes are NaN)
@@ -54,7 +57,10 @@ class Checkpoint:
         self.config = json.loads(cfg.read_text(encoding="utf-8"))
         self.text = self.config.get("text_config", self.config)
         self.files = sorted(self.dir.glob("*.safetensors")) + sorted(self.dir.glob("tensors/*.safetensors"))
-        self.shards = [p for p in self.files if re.fullmatch(r"model-\d+-of-\d+\.safetensors", p.name)]
+        # the shards: model-NNNNN-of-NNNNN.safetensors, or the files model.safetensors.index.json maps tensors to
+        index = self.dir / "model.safetensors.index.json"
+        listed = set(json.loads(index.read_text(encoding="utf-8")).get("weight_map", {}).values()) if index.is_file() else set()
+        self.shards = [p for p in self.files if re.fullmatch(r"model-\d+-of-\d+\.safetensors", p.name) or p.name in listed]
         if not self.shards:
             raise S.ConvertError(f"{self.dir}: no model-NNNNN-of-NNNNN.safetensors shards")
         side = side or {}
@@ -334,7 +340,7 @@ class Tensor:
 
 def _index(how: str, n: int, first: int) -> np.ndarray | None:
     if how in ("heads", "negexp"):
-        return S.gdn_block_source()
+        return S.gdn_block_source(n)
     if how in ("vrows", "gconv"):
         return S.gdn_index(n, first)
     if how in ("zrows", "vcols"):

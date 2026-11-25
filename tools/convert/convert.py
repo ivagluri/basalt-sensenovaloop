@@ -67,8 +67,11 @@ From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoi
                      their values, a BF16 head becomes FP8 E4M3 rows, the drafter's BF16 projections Q8_0, the vision
                      tower an mmproj GGUF; tokenizer and metadata from the checkpoint's files. Everything comes from DIR.
   --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
-  --head fp8|nvfp4   a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448, the default) or rounded once
-                     to NVFP4 (UE4M3 scale of least squared error per 16 values); a head already NVFP4 is kept
+  --head fp8|nvfp4|q8  a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448, the default), rounded once
+                     to NVFP4 (UE4M3 scale of least squared error per 16 values) or to Q8_0; a head already NVFP4 is kept
+  A BF16 checkpoint (every projection BF16) becomes Q8_0 projections. A SenseNova Loop checkpoint (model_type
+  sensenova_loop) converts the same way as a sensenova_loop pack: its loop, its hyper-connection routers (FP32) and its
+  YaRN rope as the checkpoint gives them.
 
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
@@ -870,9 +873,9 @@ def main():
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
     ap.add_argument("--drafter", metavar="DIR", help="with a qwen35 --checkpoint: a DFlash 2 block drafter (z-lab's "
                     "DFlash2DraftModel safetensors and config.json) added as dflash.* tensors")
-    ap.add_argument("--head", choices=("fp8", "nvfp4"),
+    ap.add_argument("--head", choices=("fp8", "nvfp4", "q8"),
                     help="with a qwen35 --checkpoint whose head is BF16: round it to FP8 rows with a scale per row "
-                         "(default) or to NVFP4")
+                         "(default), to NVFP4, or to Q8_0")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --gguf: print every section's offset and size and write nothing")

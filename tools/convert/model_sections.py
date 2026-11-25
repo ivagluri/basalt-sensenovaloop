@@ -709,16 +709,20 @@ GDN_QK_ROWS = 4096
 Q6K_LAYOUT = {"attn_qkv": "rows", "attn_gate": "rows", "ssm_out": "cols"}
 
 
-def gdn_block_source() -> np.ndarray:
-    j = np.arange(GDN_V_HEADS)
-    return (j % GDN_K_HEADS) * (GDN_V_HEADS // GDN_K_HEADS) + j // GDN_K_HEADS
+def gdn_block_source(v_heads: int = GDN_V_HEADS) -> np.ndarray:
+    """The checkpoint's value head at each GGUF value head, for `v_heads` value heads (a multiple of the 16 key heads)."""
+    if v_heads % GDN_K_HEADS:
+        raise ConvertError(f"{v_heads} GDN value heads are not a multiple of the {GDN_K_HEADS} key heads")
+    j = np.arange(v_heads)
+    return (j % GDN_K_HEADS) * (v_heads // GDN_K_HEADS) + j // GDN_K_HEADS
 
 
 def gdn_index(n: int, first: int) -> np.ndarray:
-    """Checkpoint index of each of the GGUF's n positions: identity below `first`, head-block reordered above."""
+    """Checkpoint index of each of the GGUF's n positions: identity below `first`, head-block reordered above (the
+    value heads are the 128-wide blocks there)."""
     idx = np.arange(n)
     blocks = (n - first) // GDN_HEAD
-    idx[first:] = first + (gdn_block_source()[:blocks, None] * GDN_HEAD + np.arange(GDN_HEAD)).reshape(-1)
+    idx[first:] = first + (gdn_block_source(blocks)[:, None] * GDN_HEAD + np.arange(GDN_HEAD)).reshape(-1)
     return idx
 
 
