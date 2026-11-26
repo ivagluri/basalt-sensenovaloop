@@ -4,7 +4,7 @@ A fork of [Basalt](https://github.com/jesdga95/basalt) that adds
 [SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-Loop-9B): a dense 9B model whose middle 24 layers run twice
 (56 layer passes a token) with two-stream hyper-connections, plus its official
 [DFlash 2 drafter](https://huggingface.co/sensenova/SenseNova-Loop-9B-DFlash2). It is an experiment, not part of Basalt and
-not supported by its maintainers. The model's own project, with its paper, code and evaluations:
+not supported by its maintainers. The model's own project, with its code, architecture and evaluations:
 [OpenSenseNova/SenseNova-Loop](https://github.com/OpenSenseNova/SenseNova-Loop). Everything else in Basalt is unchanged; this fork is rebased onto Basalt's `main` from
 time to time.
 
