@@ -37,7 +37,7 @@ runs (MTP drafting, DFlash 2 with int8 KV, DFlash 2 with NVFP4 KV); one sampled 
 ## Quick start
 
 ```sh
-git clone <this repository> basalt-sensenovaloop && cd basalt-sensenovaloop
+git clone https://github.com/ivagluri/basalt-sensenovaloop && cd basalt-sensenovaloop
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASALT_MODELS=sensenova_loop
 cmake --build build -j
 pip install -r requirements.txt
