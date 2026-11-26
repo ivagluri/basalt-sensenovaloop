@@ -1,3 +1,5 @@
+<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/sensenova-banner-dark.png"><img src="assets/sensenova-banner-light.png" alt="SenseNova-Loop-9B on Basalt, one RTX 5070 Ti: prefill 4.2K tok/s; generation with DFlash 2 at 164, 210 and 152 tok/s for 49, 4,756 and 21,851-token prompts; SenseNova's own figure 268 tok/s on 4x H800" width="800"></picture></p>
+
 > **basalt-sensenovaloop:** this fork adds SenseNova-Loop-9B and its DFlash 2 drafter to Basalt. What it runs, how to build and convert, and what it changes: [FORK.md](FORK.md). The rest of this README is Basalt's own.
 
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
