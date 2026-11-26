@@ -84,7 +84,12 @@ On an RTX 5070 Ti, the Q8_0 pack:
   generated tokens match; where they part, the reference's top two were tied in BF16, and given Basalt's token the
   reference's next choices are Basalt's.
 - `--kv fp16` and `--kv int8` give the same tokens on prompts of 1,500 and 4,756 tokens (two prompt chunks); `--kv nvfp4` the
-  same at 4,756, a different continuation from the fourth token at 1,500.
+  same at 4,756 (400 tokens), a different continuation from the fourth token at 1,500, where the reference's top two are
+  0.125 apart in log-probability (`" of"` -1.709, `" and"` -1.834) and nvfp4 takes the reference's first. On a prompt of
+  21,851 tokens all three part within 50 tokens (fp16 and int8 at the 48th, fp16 and nvfp4 at the 36th), each on a sound
+  continuation. KL divergence on the 2-chunk base: int8 0.0036 (same top-1 97.65%), nvfp4 0.0103 (95.49%).
+- `--kv nvfp4` is what lets 131,072 cells fit beside the Q8_0 pack and the DFlash 2 drafter on a 16 GB card (3.1 GiB
+  left); with int8 the planner stops about 235 MiB short.
 - A prompt reads at about 4,000 tokens/s; decoding without drafting at about 47 tokens/s (Q8_0 reads about 13.8 GB a token);
   with the MTP drafter 55 to 100 tokens/s in the server.
 - The server: answers, a tool call, thinking on and off.
