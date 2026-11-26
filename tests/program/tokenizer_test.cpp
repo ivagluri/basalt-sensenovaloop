@@ -71,7 +71,7 @@ void pretok_marks() {
         std::vector<size_t> q2, q35;
     };
     const Case cases[] = {
-        {"e\xcc\x81cole", {1, 7}, {7}},
+        {"e\xcc\x81" "cole", {1, 7}, {7}},
         {"na\xcc\x83o e\xcc\x81 ", {2, 5, 7, 9, 10}, {5, 9, 10}},
         {"\xe0\xa4\x95\xe0\xa4\xbf\xe0\xa4\xa4\xe0\xa4\xbe\xe0\xa4\xac x", {3, 9, 15, 17}, {15, 17}},
         {"a \xcc\x81\xcc\x81" "b", {1, 6, 7}, {1, 7}},
