@@ -1,3 +1,5 @@
+> **basalt-sensenovaloop:** this fork adds SenseNova-Loop-9B and its DFlash 2 drafter to Basalt. What it runs, how to build and convert, and what it changes: [FORK.md](FORK.md). The rest of this README is Basalt's own.
+
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
 Basalt is a local inference engine for large language models: **Qwen3.8-Flash-Next**, **DeepSeek-V4.1-Flash**, **Qwen3.8-27B**, **Hy4-flash** and **Inkling 2 Mini**. It runs

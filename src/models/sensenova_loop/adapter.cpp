@@ -205,9 +205,8 @@ public:
     }
 
     // Unless --spec says otherwise (0 or 1: plain decode): the pack's DFlash 2 block drafter drafts windows of up to
-    // kBlockSpec, else its MTP layer windows of up to kMtpSpec.  Each MTP draft reads the whole head, and past the second
-    // position few drafts are kept: on an RTX 5070 Ti, 128 greedy tokens of the Q8_0 pack took 1.43 s at --spec 3, 1.48 s at
-    // 4, 1.63 s at 2, 2.74 s without drafting and 2.76 s at 16.
+    // kBlockSpec (its trained block), else its MTP layer windows of up to kMtpSpec (each MTP draft reads the whole head, and
+    // past the second position few are kept).  The measurements behind both: docs/models/sensenova-loop.md#drafting.
     int planned_spec(const program::CommonOptions& o) const override {
         if (o.spec_given) return o.spec >= 2 ? o.spec : 0;
         return default_spec(o.model);
